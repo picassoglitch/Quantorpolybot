@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Settings</h2>
+<p style="color: var(--muted);">
+  Edit the credentials and endpoints the bot uses. Saved values are written
+  to <code>.env</code> (the previous file is backed up to
+  <code>.env.bak</code>) and reloaded into the running process — no
+  restart required for code that reads env at call time
+  (Ollama client, FRED feed, py-clob-client wrapper).
+</p>
+
+{% if saved %}
+  <div class="banner banner--live" style="background: var(--good); color: #0e1116;">
+    Saved {{ saved }} setting(s).
+  </div>
+{% endif %}
+
+<div class="card wide">
+  <h2>Ollama</h2>
+  <ul class="kv">
+    <li><span>Server reachable</span>
+      {% if ollama_status.reachable %}
+        <span class="ok">YES — {{ ollama_status.tag_count }} model(s) installed</span>
+      {% else %}
+        <span class="bad">NO — {{ ollama_status.error or "unreachable" }}</span>
+      {% endif %}
+    </li>
+    <li><span>Configured model</span>
+      {% if ollama_status.model_present %}
+        <span class="ok">{{ ollama_status.configured_model }} (installed)</span>
+      {% else %}
+        <span class="bad">
+          {{ ollama_status.configured_model }}
+          {% if ollama_status.reachable %}— NOT installed. Run
+            <code>ollama pull {{ ollama_status.configured_model }}</code>
+            in a terminal.{% endif %}
+        </span>
+      {% endif %}
+    </li>
+    {% if ollama_status.installed_models %}
+    <li><span>Installed models</span>
+      <span style="color: var(--muted);">{{ ollama_status.installed_models | join(", ") }}</span>
+    </li>
+    {% endif %}
+  </ul>
+</div>
+
+<form method="post" action="/settings" class="card wide" style="margin-top: 16px;">
+  <h2>Credentials &amp; endpoints</h2>
+  <p style="color: var(--muted); margin-top: 0;">
+    Sensitive values are masked after save. Leave a sensitive field
+    blank to keep the existing value; type a new value to overwrite,
+    or type <code>__clear__</code> to delete it.
+  </p>
+
+  {% for f in fields %}
+    <div style="margin: 12px 0; border-bottom: 1px solid var(--line); padding-bottom: 12px;">
+      <label for="f_{{ f.key }}" style="display: block; font-weight: bold;">
+        {{ f.label }}
+        <span style="color: var(--muted); font-weight: normal;">({{ f.key }})</span>
+        {% if f.set %}
+          <span class="ok" style="font-size: 11px;">SET</span>
+        {% else %}
+          <span class="bad" style="font-size: 11px;">EMPTY</span>
+        {% endif %}
+      </label>
+      {% if f.help_text %}
+        <small style="color: var(--muted); display: block; margin: 4px 0;">{{ f.help_text }}</small>
+      {% endif %}
+      {% if f.sensitive %}
+        <div style="color: var(--muted); font-size: 11px; margin: 4px 0;">
+          Currently: <code>{{ f.masked or "(empty)" }}</code>
+        </div>
+        <input id="f_{{ f.key }}" name="{{ f.key }}" type="password"
+               autocomplete="new-password"
+               placeholder="Leave blank to keep existing value"
+               style="width: 100%; padding: 6px 8px; background: #0a0d12;
+                      color: var(--text); border: 1px solid var(--line);
+                      border-radius: 4px; font-family: inherit;" />
+      {% else %}
+        <input id="f_{{ f.key }}" name="{{ f.key }}" type="text"
+               value="{{ f.value }}"
+               style="width: 100%; padding: 6px 8px; background: #0a0d12;
+                      color: var(--text); border: 1px solid var(--line);
+                      border-radius: 4px; font-family: inherit;" />
+      {% endif %}
+    </div>
+  {% endfor %}
+
+  <button type="submit" style="margin-top: 8px;">Save settings</button>
+</form>
+{% endblock %}

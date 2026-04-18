@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import httpx
 import yaml
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -18,9 +20,42 @@ from core.state.balances import (
 )
 from core.state.health import latest as latest_health, run_all as run_all_health
 from core.state.positions import list_open
-from core.utils.config import get_config, root_dir
+from core.utils.config import env, get_config, root_dir
 from core.utils.db import fetch_all
 from core.utils.helpers import now_ts
+from core.utils.secrets import EDITABLE_KEYS, fields_for_dashboard, update_env
+
+
+async def _ollama_status() -> dict:
+    """Probe the local Ollama server and report installed models + whether
+    the configured model is one of them. Used by the settings page."""
+    host = env("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    configured = env("OLLAMA_MODEL", "mistral")
+    out = {
+        "host": host,
+        "configured_model": configured,
+        "reachable": False,
+        "tag_count": 0,
+        "installed_models": [],
+        "model_present": False,
+        "error": "",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{host}/api/tags")
+            r.raise_for_status()
+            data = r.json()
+        models = [m.get("name", "") for m in (data.get("models") or [])]
+        out["reachable"] = True
+        out["installed_models"] = models
+        out["tag_count"] = len(models)
+        # Match either exact tag ("mistral:latest") or stem ("mistral").
+        out["model_present"] = any(
+            m == configured or m.split(":", 1)[0] == configured for m in models
+        )
+    except Exception as e:
+        out["error"] = str(e)
+    return out
 
 
 def create_app() -> FastAPI:
@@ -134,6 +169,39 @@ def create_app() -> FastAPI:
         cfg.save(data)
         cfg.reload()
         return RedirectResponse("/", status_code=303)
+
+    @app.get("/settings", response_class=HTMLResponse)
+    async def settings_page(request: Request, saved: int = 0) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request,
+            "settings.html",
+            {
+                "title": "Settings",
+                "refresh": 0,  # don't auto-refresh while editing
+                "dry_run": bool(cfg.get("dry_run", default=True)),
+                "live_enabled": bool(cfg.get("live_trading_enabled", default=False)),
+                "fields": fields_for_dashboard(),
+                "ollama_status": await _ollama_status(),
+                "saved": saved,
+            },
+        )
+
+    @app.post("/settings")
+    async def settings_save(request: Request) -> RedirectResponse:
+        form = await request.form()
+        updates: dict[str, str] = {}
+        for key, _label, sensitive, _help in EDITABLE_KEYS:
+            if key not in form:
+                continue
+            raw = (form.get(key) or "").strip()
+            if sensitive and raw == "":
+                # Blank sensitive field = keep existing value, don't overwrite.
+                continue
+            if raw == "__clear__":
+                raw = ""
+            updates[key] = raw
+        update_env(updates)
+        return RedirectResponse(f"/settings?saved={len(updates)}", status_code=303)
 
     @app.get("/api/health")
     async def api_health():
