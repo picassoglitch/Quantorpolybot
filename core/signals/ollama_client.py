@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import weakref
 from typing import Any
 
 import httpx
@@ -23,14 +24,39 @@ _COOLDOWN_SECONDS = 60.0
 
 
 class OllamaClient:
+    # Track every live instance so the Settings page can reset back-off
+    # state across the whole process when host/model change.
+    _instances: "weakref.WeakSet[OllamaClient]" = weakref.WeakSet()
+
     def __init__(self) -> None:
-        self.host = env("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-        self.model = env("OLLAMA_MODEL", "mistral")
         timeout = float(get_config().get("signals", "ollama_timeout_seconds", default=60))
         self._timeout = timeout
         self._consecutive_failures = 0
         self._cooldown_until = 0.0
-        self._missing_model_warned = False
+        # Track the model name we last warned about so changing it via the
+        # dashboard re-arms the warning for the new model.
+        self._missing_model_warned_for: str | None = None
+        OllamaClient._instances.add(self)
+
+    @classmethod
+    def _reset_global_cooldowns(cls) -> None:
+        """Clear back-off state on every live client. Called by the
+        Settings page after the user updates OLLAMA_* env vars so the new
+        config gets tried immediately."""
+        for inst in list(cls._instances):
+            inst._consecutive_failures = 0
+            inst._cooldown_until = 0.0
+            inst._missing_model_warned_for = None
+
+    @property
+    def host(self) -> str:
+        # Read at call time so changes from the Settings page take effect
+        # without a process restart.
+        return env("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+
+    @property
+    def model(self) -> str:
+        return env("OLLAMA_MODEL", "mistral")
 
     def _in_cooldown(self) -> bool:
         return time.monotonic() < self._cooldown_until
@@ -52,14 +78,15 @@ class OllamaClient:
     def _explain_failure(self, e: Exception) -> None:
         # 404 from /api/generate almost always means the model isn't pulled.
         if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
-            if not self._missing_model_warned:
+            current_model = self.model
+            if self._missing_model_warned_for != current_model:
                 logger.warning(
                     "[ollama] /api/generate returned 404 — model '{}' is not "
                     "available locally. Run `ollama pull {}` to install it. "
-                    "Further 404s will be suppressed.",
-                    self.model, self.model,
+                    "Further 404s for this model will be suppressed.",
+                    current_model, current_model,
                 )
-                self._missing_model_warned = True
+                self._missing_model_warned_for = current_model
             return
         # Otherwise log every failure (transient network / timeout / etc).
         logger.warning("[ollama] request failed: {}", e)

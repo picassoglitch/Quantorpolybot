@@ -180,10 +180,13 @@ def update_env(updates: dict[str, str]) -> None:
             new_lines.append(f"{key}={_quote_for_write(val)}\n")
             appended_any = True
 
-        # Backup + atomic replace.
+        # Backup + atomic replace. Use with_name() not with_suffix(): the
+        # file is literally named ".env" (no stem), so with_suffix(".env.bak")
+        # would produce ".env.env.bak".
+        backup = path.with_name(path.name + ".bak")
+        tmp = path.with_name(path.name + ".tmp")
         if path.exists():
-            shutil.copy2(path, path.with_suffix(".env.bak"))
-        tmp = path.with_suffix(".env.tmp")
+            shutil.copy2(path, backup)
         with tmp.open("w", encoding="utf-8") as f:
             f.writelines(new_lines)
         os.replace(tmp, path)
@@ -194,3 +197,13 @@ def update_env(updates: dict[str, str]) -> None:
                 os.environ[key] = val
             else:
                 os.environ.pop(key, None)
+
+        # If Ollama settings changed, drop any active back-off so the new
+        # host/model gets tried on the next signal instead of waiting out
+        # the old cooldown window. Imported lazily to avoid a circular dep.
+        if any(k.startswith("OLLAMA_") for k in updates):
+            try:
+                from core.signals import ollama_client as _oc
+                _oc.OllamaClient._reset_global_cooldowns()
+            except Exception:
+                pass
