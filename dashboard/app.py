@@ -36,6 +36,9 @@ def create_app() -> FastAPI:
     cfg = get_config()
     refresh = int(cfg.get("dashboard", "refresh_seconds", default=10))
 
+    # Starlette >=0.29 requires `request` as the first positional argument
+    # to TemplateResponse — the legacy `(name, context)` form is removed.
+
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         health = await latest_health()
@@ -43,7 +46,6 @@ def create_app() -> FastAPI:
             health = {h.component: h for h in await run_all_health()}
         positions = await list_open()
         ctx = {
-            "request": request,
             "title": "Overview",
             "refresh": refresh,
             "dry_run": bool(cfg.get("dry_run", default=True)),
@@ -55,7 +57,7 @@ def create_app() -> FastAPI:
             "daily_pnl": await daily_pnl_usd(),
             "equity_points": await equity_curve_points(),
         }
-        return templates.TemplateResponse("index.html", ctx)
+        return templates.TemplateResponse(request, "index.html", ctx)
 
     @app.get("/markets", response_class=HTMLResponse)
     async def markets(request: Request) -> HTMLResponse:
@@ -63,8 +65,9 @@ def create_app() -> FastAPI:
             "SELECT * FROM markets WHERE active=1 ORDER BY liquidity DESC LIMIT 100"
         )
         return templates.TemplateResponse(
+            request,
             "markets.html",
-            {"request": request, "title": "Markets", "refresh": refresh, "rows": rows},
+            {"title": "Markets", "refresh": refresh, "rows": rows},
         )
 
     @app.get("/signals", response_class=HTMLResponse)
@@ -75,8 +78,9 @@ def create_app() -> FastAPI:
                ORDER BY s.created_at DESC LIMIT 100"""
         )
         return templates.TemplateResponse(
+            request,
             "signals.html",
-            {"request": request, "title": "Signals", "refresh": refresh, "rows": rows},
+            {"title": "Signals", "refresh": refresh, "rows": rows},
         )
 
     @app.get("/orders", response_class=HTMLResponse)
@@ -88,9 +92,9 @@ def create_app() -> FastAPI:
             "SELECT * FROM executions ORDER BY ts DESC LIMIT 50"
         )
         return templates.TemplateResponse(
+            request,
             "orders.html",
             {
-                "request": request,
                 "title": "Orders",
                 "refresh": refresh,
                 "orders": rows,
@@ -113,9 +117,9 @@ def create_app() -> FastAPI:
         except Exception:
             tail = "(log file unreadable)"
         return templates.TemplateResponse(
+            request,
             "logs.html",
             {
-                "request": request,
                 "title": "Logs",
                 "refresh": refresh,
                 "rows": rows,
