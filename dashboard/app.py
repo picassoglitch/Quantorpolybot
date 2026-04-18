@@ -27,6 +27,11 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Quantorpolybot")
     base = Path(__file__).parent
     templates = Jinja2Templates(directory=str(base / "templates"))
+    # Disable Jinja2's bytecode/template cache. On Python 3.14 the default
+    # LRU cache key construction blows up with
+    # "TypeError: cannot use 'tuple' as a dict key (unhashable type: 'dict')"
+    # whenever a template is rendered with a context containing dict values.
+    templates.env.cache = None
     app.mount("/static", StaticFiles(directory=str(base / "static")), name="static")
     cfg = get_config()
     refresh = int(cfg.get("dashboard", "refresh_seconds", default=10))

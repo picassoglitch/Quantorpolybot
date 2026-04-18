@@ -30,8 +30,11 @@ class PolymarketWS:
         if not cfg.get("enabled", True):
             logger.info("[poly_ws] disabled")
             return
-        backoff = Backoff(base=float(cfg.get("reconnect_seconds", 5)), cap=120)
-        logger.info("[poly_ws] starting")
+        # Longer base + larger cap so a misconfigured/changed server contract
+        # doesn't hammer the host with reconnect storms.
+        backoff = Backoff(base=float(cfg.get("reconnect_seconds", 15)), cap=600)
+        self._batch_size = int(cfg.get("subscribe_batch", 50))
+        logger.info("[poly_ws] starting (batch={})", self._batch_size)
         while not self._stop.is_set():
             try:
                 token_ids = await self._active_token_ids()
@@ -68,13 +71,16 @@ class PolymarketWS:
                 continue
             if isinstance(parsed, list):
                 ids.extend(str(t) for t in parsed if t)
-        # de-dupe, cap to a reasonable batch (CLOB WS supports many but
-        # huge subs are slow on reconnect)
-        unique = list(dict.fromkeys(ids))[:500]
+        # de-dupe; the CLOB WS rejects very large subscriptions and just
+        # closes the socket, so cap to a small batch by default.
+        cap = getattr(self, "_batch_size", 50)
+        unique = list(dict.fromkeys(ids))[:cap]
         return unique
 
     async def _connect_and_stream(self, token_ids: Iterable[str]) -> None:
-        sub = {"type": "Market", "assets_ids": list(token_ids)}
+        # CLOB WS expects uppercase channel name; both `assets_ids` and
+        # `markets` keys are accepted but the channel string is strict.
+        sub = {"type": "MARKET", "assets_ids": list(token_ids)}
         async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
             await ws.send(json.dumps(sub))
             logger.info("[poly_ws] connected, subscribed to {} tokens", len(sub["assets_ids"]))

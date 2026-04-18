@@ -64,11 +64,15 @@ feeds:
       - DGS10
       - FEDFUNDS
   metaculus:
-    enabled: true
+    # Disabled by default — Metaculus closed public access to /api2/questions/
+    # in late 2025 (now returns 403). Flip to true once you have an API token
+    # workflow wired up, otherwise this just spams the log.
+    enabled: false
     poll_seconds: 1800
   polymarket_ws:
     enabled: true
-    reconnect_seconds: 5
+    reconnect_seconds: 15
+    subscribe_batch: 50
 
 # ---- Markets ----
 markets:

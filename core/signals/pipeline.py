@@ -90,17 +90,23 @@ class SignalPipeline:
         if not markets:
             return
         prompt_version, template = get_prompts().active()
-        prompt = template.format(
-            news_item=json.dumps(
-                {
-                    "source": item.get("source"),
-                    "title": item.get("title"),
-                    "summary": (item.get("summary") or "")[:1000],
-                    "url": item.get("url"),
-                },
-                ensure_ascii=False,
-            ),
-            candidates=json.dumps(serialize_candidates(markets), ensure_ascii=False),
+        news_item_json = json.dumps(
+            {
+                "source": item.get("source"),
+                "title": item.get("title"),
+                "summary": (item.get("summary") or "")[:1000],
+                "url": item.get("url"),
+            },
+            ensure_ascii=False,
+        )
+        candidates_json = json.dumps(serialize_candidates(markets), ensure_ascii=False)
+        # Use .replace() not .format() — the prompt template contains a literal
+        # JSON schema example with {} braces that would otherwise blow up
+        # str.format with KeyError on the inner JSON keys.
+        prompt = (
+            template
+            .replace("{news_item}", news_item_json)
+            .replace("{candidates}", candidates_json)
         )
         result = await self._ollama.generate_json(prompt)
         if not result:
