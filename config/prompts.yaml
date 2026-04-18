@@ -1,0 +1,39 @@
+# Versioned signal prompts. The active prompt is selected by
+# config.signals.prompt_version. The learning module appends new
+# evolved versions and may bump the active version when a new prompt
+# beats the current one in backtest.
+
+active: v1
+
+versions:
+  v1: |
+    You are a disciplined Polymarket prediction-market analyst.
+
+    Given a NEWS_ITEM and a list of CANDIDATE_MARKETS, decide whether
+    the news materially shifts the probability of any candidate's YES
+    outcome. If none of the markets are relevant, return market_id null.
+
+    Reply with STRICT JSON ONLY (no prose, no code fences):
+
+    {
+      "market_id": "<id from candidate list, or null>",
+      "implied_prob": <float 0..1, your estimated YES probability>,
+      "confidence": <float 0..1, your confidence in this estimate>,
+      "reasoning": "<one short sentence>"
+    }
+
+    Hard rules:
+    - Be skeptical. If the news is rumour, opinion, or unrelated, set
+      market_id to null.
+    - Never copy the market's current price as your implied_prob.
+    - Confidence below 0.5 means "do not trade".
+    - Output JSON only. No markdown.
+
+    NEWS_ITEM:
+    {news_item}
+
+    CANDIDATE_MARKETS:
+    {candidates}
+
+  # Future evolved prompts will be appended here automatically by the
+  # learning module, e.g. v2, v3, ...

@@ -1,0 +1,114 @@
+# =====================================================================
+# Quantorpolybot configuration. All tunable knobs live here.
+# Anything in this file may be overwritten by the optimization module
+# at night if a backtested config improves Sharpe/PnL by >5%. The
+# previous config is always backed up to config/config.yaml.bak first.
+# =====================================================================
+
+# ---- Safety ----
+# Real orders are submitted ONLY when BOTH flags below are false/true
+# in the right combination. Otherwise the bot prints
+# "DRY RUN - would have placed order ...".
+dry_run: true                   # true = simulate only
+live_trading_enabled: false     # must be true AND dry_run false to trade
+
+# ---- Database / paths ----
+db_path: polybot.db
+log_dir: logs
+
+# ---- Risk limits (USD) ----
+risk:
+  max_position_usd: 50.0          # per single market
+  max_total_exposure_usd: 500.0   # across all open positions
+  max_daily_loss_usd: 50.0        # bot halts when breached
+  max_market_spread: 0.05         # |ask-bid| / mid
+  min_market_liquidity: 1000.0    # USD on the book
+  min_confidence: 0.65            # LLM confidence
+  min_edge: 0.04                  # |implied_prob - mid|
+  stale_price_seconds: 60         # ignore quote older than this
+  cooldown_seconds: 600           # per-market trade cooldown
+  max_orders_per_market: 1
+  max_correlated_exposure_usd: 200.0  # per category bucket
+
+# ---- Sizing (Kelly) ----
+kelly:
+  enabled: true
+  fraction: 0.25                  # fractional Kelly safety multiplier
+  min_size_usd: 5.0
+  max_size_usd: 50.0
+
+# ---- Execution ----
+execution:
+  order_timeout_seconds: 90       # cancel unfilled orders after
+  edge_pricing_factor: 0.5        # mid + edge*factor
+  poll_interval_seconds: 5        # how often we check fills
+  max_open_orders: 25
+
+# ---- Feeds ----
+feeds:
+  rss:
+    enabled: true
+    poll_seconds: 60
+    sources:
+      - https://feeds.reuters.com/reuters/topNews
+      - https://feeds.bbci.co.uk/news/world/rss.xml
+      - https://www.aljazeera.com/xml/rss/all.xml
+      - https://feeds.npr.org/1001/rss.xml
+      - https://rss.cnn.com/rss/edition.rss
+  fred:
+    enabled: true
+    poll_seconds: 3600
+    series:
+      - CPIAUCSL
+      - UNRATE
+      - DGS10
+      - FEDFUNDS
+  metaculus:
+    enabled: true
+    poll_seconds: 1800
+  polymarket_ws:
+    enabled: true
+    reconnect_seconds: 5
+
+# ---- Markets ----
+markets:
+  refresh_seconds: 300
+  gamma_url: https://gamma-api.polymarket.com/markets
+  page_size: 100
+  max_pages: 30
+  active_only: true
+
+# ---- Signals ----
+signals:
+  candidates_per_item: 5
+  ollama_timeout_seconds: 60
+  prompt_version: v1
+
+# ---- Scheduler ----
+scheduler:
+  market_refresh_cron: "*/5 * * * *"
+  health_check_cron: "*/1 * * * *"
+  optimization_cron: "5 3 * * *"     # 03:05 daily
+  learning_cron: "30 3 * * *"        # 03:30 daily
+  backtest_window_days: 30
+
+# ---- Optimization ----
+optimization:
+  enabled: true
+  improvement_threshold: 0.05        # require >5% Sharpe/PnL gain
+  param_grid:
+    min_confidence: [0.55, 0.65, 0.75]
+    min_edge: [0.02, 0.04, 0.06]
+    kelly_fraction: [0.10, 0.25, 0.50]
+
+# ---- Learning ----
+learning:
+  enabled: true
+  lookback_days: 14
+  keep_best_n_prompts: 5
+
+# ---- Dashboard ----
+dashboard:
+  host: 127.0.0.1
+  port: 8000
+  refresh_seconds: 10

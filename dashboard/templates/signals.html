@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card wide">
+  <h2>Recent signals</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>When</th><th>Question</th><th>Side</th>
+        <th>Implied</th><th>Mid</th><th>Edge</th>
+        <th>Conf</th><th>Size $</th><th>Status</th><th>Reasoning</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td><small>{{ '%.0f'|format(r.created_at or 0) }}</small></td>
+        <td>{{ (r.question or '')[:60] }}</td>
+        <td>{{ r.side }}</td>
+        <td>{{ '%.3f'|format(r.implied_prob or 0) }}</td>
+        <td>{{ '%.3f'|format(r.mid_price or 0) }}</td>
+        <td>{{ '%+.3f'|format(r.edge or 0) }}</td>
+        <td>{{ '%.2f'|format(r.confidence or 0) }}</td>
+        <td>${{ '%.2f'|format(r.size_usd or 0) }}</td>
+        <td>{{ r.status }}</td>
+        <td><small>{{ (r.reasoning or '')[:120] }}</small></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card wide">
+  <h2>Active markets watchlist</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Market</th><th>Question</th><th>Category</th>
+        <th>Bid</th><th>Ask</th><th>Last</th><th>Liquidity</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td><code>{{ r.market_id[:14] }}...</code></td>
+        <td>{{ (r.question or '')[:90] }}</td>
+        <td>{{ r.category }}</td>
+        <td>{{ '%.3f'|format(r.best_bid or 0) }}</td>
+        <td>{{ '%.3f'|format(r.best_ask or 0) }}</td>
+        <td>{{ '%.3f'|format(r.last_price or 0) }}</td>
+        <td>${{ '%.0f'|format(r.liquidity or 0) }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

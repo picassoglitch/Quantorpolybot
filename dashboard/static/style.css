@@ -1,0 +1,97 @@
+:root {
+  --bg: #0e1116;
+  --panel: #161b22;
+  --line: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --good: #3fb950;
+  --bad: #f85149;
+  --warn: #d29922;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.banner {
+  padding: 8px 16px;
+  text-align: center;
+  font-weight: bold;
+}
+.banner--warn { background: var(--warn); color: #1d1d1d; }
+.banner--live { background: var(--bad); color: white; }
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 24px;
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.topbar h1 { margin: 0; font-size: 18px; color: var(--accent); }
+.topbar nav a {
+  color: var(--text);
+  margin-right: 16px;
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+}
+.topbar nav a:hover { border-bottom-color: var(--accent); }
+
+main { padding: 16px 24px; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px 16px;
+}
+.card.wide { grid-column: 1 / -1; }
+.card h2 { margin: 0 0 8px; font-size: 14px; color: var(--accent); }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: normal; }
+
+code { color: var(--accent); }
+.ok { color: var(--good); font-weight: bold; }
+.bad { color: var(--bad); font-weight: bold; }
+.kv { list-style: none; padding: 0; margin: 0; }
+.kv li { display: flex; justify-content: space-between; padding: 2px 0; }
+.kv span { color: var(--muted); }
+
+button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+button.danger { background: var(--bad); }
+.kill-switch .hint { color: var(--muted); font-size: 11px; margin-top: 8px; }
+
+footer { padding: 16px 24px; color: var(--muted); }
+
+pre.logtail, pre.ascii-chart {
+  background: #0a0d12;
+  padding: 12px;
+  border-radius: 4px;
+  overflow: auto;
+  max-height: 360px;
+  white-space: pre-wrap;
+}

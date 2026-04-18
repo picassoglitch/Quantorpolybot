@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="grid">
+  <div class="card">
+    <h2>Health</h2>
+    <table>
+      <thead><tr><th>Component</th><th>Status</th><th>Detail</th></tr></thead>
+      <tbody>
+      {% for name, h in health.items() %}
+        <tr>
+          <td>{{ name }}</td>
+          <td class="{{ 'ok' if h.ok else 'bad' }}">{{ 'OK' if h.ok else 'DOWN' }}</td>
+          <td><code>{{ h.detail }}</code></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>PnL</h2>
+    <ul class="kv">
+      <li><span>Open exposure</span><b>${{ '%.2f'|format(exposure) }}</b></li>
+      <li><span>Realised PnL (all)</span><b>${{ '%.2f'|format(realized_pnl) }}</b></li>
+      <li><span>Realised PnL (24h)</span><b>${{ '%.2f'|format(daily_pnl) }}</b></li>
+      <li><span>Open positions</span><b>{{ positions|length }}</b></li>
+    </ul>
+  </div>
+
+  <div class="card kill-switch">
+    <h2>Kill Switch</h2>
+    <p>Live trading is currently <b>{{ 'ON' if live_enabled else 'OFF' }}</b>.</p>
+    <form action="/kill-switch" method="post">
+      {% if live_enabled %}
+        <input type="hidden" name="enabled" value="false">
+        <button type="submit" class="danger">Disable live trading</button>
+      {% else %}
+        <input type="hidden" name="enabled" value="true">
+        <button type="submit">Enable live trading</button>
+      {% endif %}
+      <p class="hint">dry_run must also be false in config.yaml.</p>
+    </form>
+  </div>
+
+  <div class="card wide">
+    <h2>Open positions</h2>
+    {% if positions %}
+    <table>
+      <thead><tr><th>Market</th><th>Side</th><th>Size</th><th>Avg price</th><th>Realised PnL</th></tr></thead>
+      <tbody>
+      {% for p in positions %}
+        <tr>
+          <td><code>{{ p.market_id[:14] }}...</code></td>
+          <td>{{ p.side }}</td>
+          <td>{{ '%.4f'|format(p.size) }}</td>
+          <td>{{ '%.3f'|format(p.avg_price) }}</td>
+          <td>${{ '%.2f'|format(p.realized_pnl_usd) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<p>No open positions.</p>{% endif %}
+  </div>
+
+  <div class="card wide">
+    <h2>Equity curve</h2>
+    {% if equity_points %}
+    <pre class="ascii-chart">
+{% for ts, pnl in equity_points -%}
+{{ '%.2f'|format(pnl) }}
+{% endfor %}
+    </pre>
+    {% else %}<p>No data yet.</p>{% endif %}
+  </div>
+</section>
+{% endblock %}
