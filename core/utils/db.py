@@ -170,6 +170,22 @@ SCHEMA = [
         notes TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS cross_references (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        polymarket_id TEXT,
+        source TEXT,
+        source_market_name TEXT,
+        source_price REAL,
+        poly_price REAL,
+        divergence REAL,
+        fetched_at REAL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cross_refs_market ON cross_references(polymarket_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cross_refs_div ON cross_references(divergence)",
+    "CREATE INDEX IF NOT EXISTS idx_cross_refs_fetched ON cross_references(fetched_at)",
+    "CREATE INDEX IF NOT EXISTS idx_feed_items_source ON feed_items(source)",
 ]
 
 

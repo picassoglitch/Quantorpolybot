@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.markets.cache import Market, candidate_markets
+from core.markets.cache import Market, candidate_markets, candidate_markets_scored
 from core.utils.config import get_config
 
 
 async def candidates_for(text: str) -> list[Market]:
     n = int(get_config().get("signals", "candidates_per_item", default=5))
     return await candidate_markets(text, top_n=n)
+
+
+async def scored_candidates_for(text: str) -> list[tuple[float, Market]]:
+    n = int(get_config().get("signals", "candidates_per_item", default=5))
+    return await candidate_markets_scored(text, top_n=n)
 
 
 def serialize_candidates(markets: list[Market]) -> list[dict[str, Any]]:

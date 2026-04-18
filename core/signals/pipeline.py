@@ -17,7 +17,10 @@ from loguru import logger
 from core.execution.orders import OrderEngine
 from core.markets.cache import get_market
 from core.risk.rules import RiskEngine, RiskRejection
-from core.signals.candidates import candidates_for, serialize_candidates
+from core.signals.candidates import (
+    scored_candidates_for,
+    serialize_candidates,
+)
 from core.signals.ollama_client import OllamaClient
 from core.utils.config import get_config, get_prompts
 from core.utils.db import execute, fetch_all, fetch_one
@@ -86,9 +89,47 @@ class SignalPipeline:
         text = f"{item.get('title', '')}\n{item.get('summary', '')}".strip()
         if not text:
             return
-        markets = await candidates_for(text)
-        if not markets:
+        scored = await scored_candidates_for(text)
+        if not scored:
             return
+        markets = [m for _, m in scored]
+        # Pre-filter: feeds that already nominate a specific market
+        # (polymarket_news, predictit_xref, google_news per-market query)
+        # bypass the keyword check; everything else must clear the
+        # configured min_keyword_overlap or we save a 'keyword_mismatch'
+        # row and skip Ollama. Saves big on local LLM time for the
+        # broad-topic feeds (Reuters, BBC, Wikipedia).
+        meta = _decode_meta(item.get("meta"))
+        linked_id = (meta.get("linked_market_id") or "").strip()
+        if not linked_id:
+            min_overlap = float(
+                get_config().get("signals", "min_keyword_overlap", default=0.05)
+            )
+            best_score = scored[0][0]
+            if best_score < min_overlap:
+                await execute(
+                    """INSERT INTO signals
+                    (feed_item_id, market_id, implied_prob, confidence, edge,
+                     mid_price, side, size_usd, reasoning, prompt_version,
+                     created_at, status)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        int(item["id"]),
+                        None,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        "NONE",
+                        0.0,
+                        f"keyword_mismatch best_score={best_score:.3f} "
+                        f"min={min_overlap:.3f}",
+                        "prefilter",
+                        now_ts(),
+                        "keyword_mismatch",
+                    ),
+                )
+                return
         prompt_version, template = get_prompts().active()
         news_item_json = json.dumps(
             {
@@ -177,3 +218,15 @@ class SignalPipeline:
             "UPDATE signals SET status=?, reasoning=COALESCE(reasoning,'') || ?  WHERE id=?",
             ("REJECTED", f" | rejected: {reason}", signal_id),
         )
+
+
+def _decode_meta(raw: Any) -> dict[str, Any]:
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        decoded = json.loads(raw)
+        return decoded if isinstance(decoded, dict) else {}
+    except (TypeError, ValueError):
+        return {}

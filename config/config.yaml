@@ -25,7 +25,12 @@ risk:
   min_market_liquidity: 1000.0    # USD on the book
   min_confidence: 0.65            # LLM confidence
   min_edge: 0.04                  # |implied_prob - mid|
-  stale_price_seconds: 60         # ignore quote older than this
+  # The new key. The old `stale_price_seconds` is still honored as a
+  # fallback so older configs keep working, but new installs should
+  # use this name. 300s default is generous on purpose so dry-run
+  # mode produces enough signals to learn from.
+  stale_price_max_age_seconds: 300
+  stale_price_seconds: 300        # legacy alias; kept in sync above
   cooldown_seconds: 600           # per-market trade cooldown
   max_orders_per_market: 1
   max_correlated_exposure_usd: 200.0  # per category bucket
@@ -51,10 +56,18 @@ feeds:
     poll_seconds: 60
     sources:
       - https://feeds.reuters.com/reuters/topNews
+      - https://feeds.reuters.com/reuters/politicsNews
+      - https://feeds.reuters.com/reuters/businessNews
       - https://feeds.bbci.co.uk/news/world/rss.xml
       - https://www.aljazeera.com/xml/rss/all.xml
       - https://feeds.npr.org/1001/rss.xml
       - https://rss.cnn.com/rss/edition.rss
+      - https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml
+      - https://www.espn.com/espn/rss/news
+      - https://rss.politico.com/politics-news.xml
+      - https://thehill.com/rss/syndicator/19109/feed/
+      - https://www.coindesk.com/arc/outboundfeeds/rss/
+      - https://cointelegraph.com/rss
   fred:
     enabled: true
     poll_seconds: 3600
@@ -73,6 +86,49 @@ feeds:
     enabled: true
     reconnect_seconds: 15
     subscribe_batch: 50
+  polymarket_news:
+    # Per-market related news, scraped from gamma-api /markets/{id}.
+    # Active markets only; gives us news Polymarket itself associates
+    # with each question.
+    enabled: true
+    poll_seconds: 600
+    max_markets_per_cycle: 80    # cap so a 3000-market DB doesn't slam Gamma
+    request_delay_seconds: 0.25  # gentle pacing between per-market requests
+  google_news:
+    # Dynamic Google News RSS — generates queries from active market
+    # titles and rotates through them so we cover the whole market
+    # universe over time without hitting Google rate limits.
+    enabled: true
+    poll_seconds: 300
+    queries_per_cycle: 10
+    request_delay_seconds: 1.0   # 1 req/sec ceiling
+    hl: en-US
+    gl: US
+    ceid: US:en
+  wikipedia:
+    enabled: true
+    poll_seconds: 1800
+    sources:
+      - https://en.wikipedia.org/w/index.php?title=Portal:Current_events&action=raw
+      - https://www.mediawiki.org/w/index.php?title=Template:Centralized_discussion&action=raw
+  cryptopanic:
+    # Free public feed — auth_token optional but recommended
+    # (CRYPTOPANIC_API_TOKEN env var, settable from the dashboard).
+    enabled: true
+    poll_seconds: 120
+    currencies:
+      - BTC
+      - ETH
+      - SOL
+  predictit:
+    # PredictIt cross-reference. Pulls all open PredictIt markets,
+    # fuzzy-matches them to Polymarket questions, stores divergences
+    # in the cross_references table, and synthesises a feed_item for
+    # the signal pipeline whenever divergence > auto_signal_divergence.
+    enabled: true
+    poll_seconds: 600
+    auto_signal_divergence: 0.08
+    fuzzy_match_threshold: 0.40
 
 # ---- Markets ----
 markets:
@@ -87,6 +143,12 @@ signals:
   candidates_per_item: 5
   ollama_timeout_seconds: 60
   prompt_version: v1
+  # Pre-Ollama keyword filter: a feed item must share at least this
+  # much Jaccard overlap with the best-matching candidate market or
+  # we skip Ollama entirely (and log a `keyword_mismatch` signal).
+  # Items from feeds that already carry a meta.linked_market_id
+  # (e.g. polymarket_news, predictit cross-refs) bypass this check.
+  min_keyword_overlap: 0.05
 
 # ---- Scheduler ----
 scheduler:

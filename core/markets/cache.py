@@ -81,6 +81,15 @@ async def list_active(limit: int = 500) -> list[Market]:
 
 async def candidate_markets(text: str, top_n: int = 5) -> list[Market]:
     """Cheap keyword/Jaccard candidate match against active markets."""
+    return [m for _, m in await candidate_markets_scored(text, top_n)]
+
+
+async def candidate_markets_scored(
+    text: str, top_n: int = 5
+) -> list[tuple[float, Market]]:
+    """Same as ``candidate_markets`` but exposes the Jaccard score so
+    callers (e.g. the pipeline pre-filter) can decide whether the best
+    match is strong enough to spend an LLM call on."""
     target = keywords(text)
     if not target:
         return []
@@ -96,4 +105,4 @@ async def candidate_markets(text: str, top_n: int = 5) -> list[Market]:
             continue
         scored.append((score, m))
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [m for _, m in scored[:top_n]]
+    return scored[:top_n]

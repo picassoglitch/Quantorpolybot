@@ -26,6 +26,20 @@ from core.utils.helpers import now_ts
 from core.utils.secrets import EDITABLE_KEYS, fields_for_dashboard, update_env
 
 
+def _fmt_age(seconds: float | None) -> str:
+    """Render an age delta as '2m', '3h', '1d' for the Sources panel."""
+    if seconds is None or seconds < 0:
+        return "?"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
 async def _ollama_status() -> dict:
     """Probe the local Ollama server and report installed models + whether
     the configured model is one of them. Used by the settings page."""
@@ -134,6 +148,72 @@ def create_app() -> FastAPI:
                 "refresh": refresh,
                 "orders": rows,
                 "executions": executions,
+            },
+        )
+
+    @app.get("/sources", response_class=HTMLResponse)
+    async def sources(request: Request) -> HTMLResponse:
+        # Per-source ingestion stats. Cheap aggregate query — feed_items
+        # has an index on `source` so this stays fast even at 100k+ rows.
+        agg = await fetch_all(
+            """SELECT source,
+                      COUNT(*) AS total,
+                      MAX(ingested_at) AS last_fetch,
+                      SUM(CASE WHEN ingested_at >= ? THEN 1 ELSE 0 END) AS last_hour
+               FROM feed_items
+               GROUP BY source
+               ORDER BY COALESCE(last_fetch, 0) DESC"""
+            ,
+            (now_ts() - 3600,),
+        )
+        now = now_ts()
+        sources_view = []
+        for row in agg:
+            last = row["last_fetch"] or 0
+            age = now - last if last else None
+            if age is None:
+                status = "empty"
+                human = "never"
+            elif age < 1800:
+                status = "active"
+                human = _fmt_age(age)
+            else:
+                status = "idle"
+                human = _fmt_age(age)
+            sources_view.append({
+                "source": row["source"] or "(unknown)",
+                "total": row["total"] or 0,
+                "last_hour": row["last_hour"] or 0,
+                "last_fetch_human": human,
+                "status": status,
+            })
+
+        xref_rows = await fetch_all(
+            """SELECT cr.*, m.question
+               FROM cross_references cr
+               LEFT JOIN markets m ON m.market_id = cr.polymarket_id
+               ORDER BY cr.divergence DESC, cr.fetched_at DESC
+               LIMIT 50"""
+        )
+        xrefs = []
+        for r in xref_rows:
+            xrefs.append({
+                "polymarket_id": r["polymarket_id"],
+                "question": r["question"],
+                "source_market_name": r["source_market_name"],
+                "source_price": r["source_price"],
+                "poly_price": r["poly_price"],
+                "divergence": r["divergence"],
+                "fetched_human": _fmt_age(now - (r["fetched_at"] or now)),
+            })
+        return templates.TemplateResponse(
+            request,
+            "sources.html",
+            {
+                "title": "Sources",
+                "refresh": refresh,
+                "sources": sources_view,
+                "xrefs": xrefs,
             },
         )
 

@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card wide">
+  <h2>Data sources</h2>
+  <p class="muted">
+    Per-feed ingestion stats. "Last hour" counts items added in the
+    last 60 minutes; "Last fetch" is the most recent ingested_at across
+    all items from that source.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Source</th>
+        <th>Total items</th>
+        <th>Last hour</th>
+        <th>Last fetch</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for s in sources %}
+      <tr>
+        <td><code>{{ s.source }}</code></td>
+        <td>{{ s.total }}</td>
+        <td>{{ s.last_hour }}</td>
+        <td>{{ s.last_fetch_human }}</td>
+        <td>
+          {% if s.status == 'active' %}
+            <span class="ok">active</span>
+          {% elif s.status == 'idle' %}
+            <span class="warn">idle ({{ s.last_fetch_human }})</span>
+          {% else %}
+            <span class="err">no data</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card wide">
+  <h2>Cross-references (PredictIt vs Polymarket)</h2>
+  <p class="muted">
+    Recent divergences between PredictIt contract prices and the
+    matched Polymarket question's mid. Sorted by divergence; the
+    largest gaps are the ones the signal pipeline auto-promotes into
+    a feed_item when above the configured threshold.
+  </p>
+  {% if xrefs %}
+  <table>
+    <thead>
+      <tr>
+        <th>Polymarket</th>
+        <th>PredictIt contract</th>
+        <th>PI price</th>
+        <th>Poly mid</th>
+        <th>Divergence</th>
+        <th>Fetched</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for x in xrefs %}
+      <tr>
+        <td>
+          {% if x.question %}
+            {{ x.question[:70] }}
+          {% else %}
+            <code>{{ (x.polymarket_id or '')[:14] }}...</code>
+          {% endif %}
+        </td>
+        <td>{{ (x.source_market_name or '')[:60] }}</td>
+        <td>{{ '%.3f'|format(x.source_price or 0) }}</td>
+        <td>{{ '%.3f'|format(x.poly_price or 0) }}</td>
+        <td>{{ '%.3f'|format(x.divergence or 0) }}</td>
+        <td>{{ x.fetched_human }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="muted">No cross-references recorded yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

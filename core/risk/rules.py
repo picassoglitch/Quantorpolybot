@@ -45,7 +45,15 @@ class RiskEngine:
         exec_cfg = get_config().get("execution") or {}
 
         # ---- Stale price ----
-        max_stale = float(cfg.get("stale_price_seconds", 60))
+        # Prefer the new key; fall back to legacy `stale_price_seconds`
+        # so older configs still work. Default 300s is intentionally
+        # generous so dry-run mode produces enough signals to learn from.
+        max_stale = float(
+            cfg.get(
+                "stale_price_max_age_seconds",
+                cfg.get("stale_price_seconds", 300),
+            )
+        )
         if (now_ts() - market.updated_at) > max_stale:
             raise RiskRejection(f"stale price ({now_ts() - market.updated_at:.0f}s old)")
 

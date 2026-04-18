@@ -7,10 +7,15 @@ from typing import Any
 
 from loguru import logger
 
+from core.feeds.cryptopanic import CryptoPanicFeed
 from core.feeds.fred import FredFeed
+from core.feeds.google_news import GoogleNewsFeed
 from core.feeds.metaculus import MetaculusFeed
+from core.feeds.polymarket_news import PolymarketNewsFeed
 from core.feeds.polymarket_ws import PolymarketWS
+from core.feeds.predictit import PredictItFeed
 from core.feeds.rss import RSSFeed
+from core.feeds.wikipedia import WikipediaFeed
 
 
 class FeedManager:
@@ -20,6 +25,11 @@ class FeedManager:
             FredFeed(),
             MetaculusFeed(),
             PolymarketWS(),
+            PolymarketNewsFeed(),
+            GoogleNewsFeed(),
+            WikipediaFeed(),
+            CryptoPanicFeed(),
+            PredictItFeed(),
         ]
         self._tasks: list[asyncio.Task] = []
 
