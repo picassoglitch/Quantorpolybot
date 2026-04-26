@@ -536,15 +536,44 @@ ollama:
   # so the worker thread is bounded by these timeouts and the loop
   # never blocks on the network. April 2026 soak: 45/60/60 was too
   # generous and let stalled deep calls eat 60+ seconds while the
-  # watchdog accumulated `event_loop_blocked` warnings. 10/20/20 is
+  # watchdog accumulated `event_loop_blocked` warnings. 10/20/20 was
   # tighter than the GPU's natural latency for a healthy call but lets
   # the heuristic fallback take over fast on a degraded server.
-  fast_timeout_seconds: 10
+  #
+  # Soak evidence (2026-04-26 PR #10/#11 soak, 3h):
+  #   - One observed timeout: "tier=fast TIMEOUT wait_ms=10724
+  #     budget=10000ms overrun=724ms" — a healthy GPU call missed by
+  #     0.7s, not a hang.
+  #   - qwen2.5:7b q4_K_M GPU latency math: 1-3s first-token + 300
+  #     tokens / 30-50 tok/s = 9-10s end-to-end. The 10s budget was
+  #     structurally at the edge.
+  #   - 15s gives healthy calls breathing room without un-bounding;
+  #     pairs with the num_predict drop below to keep the worst case
+  #     well under 15s. Deep/validator unchanged — those have their
+  #     own latency profile.
+  fast_timeout_seconds: 15
   deep_timeout_seconds: 20
   validator_timeout_seconds: 20
   fast_temperature: 0.2
   deep_temperature: 0.3
   validator_temperature: 0.1
+  # Maximum tokens generated per call. Was defaulted to 300 in code
+  # (core/signals/ollama_client.py) — the fast-tier prompts ask for
+  # compact JSON like {"implied_prob": 0.35, "confidence": 0.65,
+  # "reasoning": "..."} which fits in 80-150 tokens; 300 was over-
+  # allocated and the trailing tail was eating the timeout budget.
+  #
+  # Soak evidence (2026-04-26 PR #10/#11 soak, 3h):
+  #   - Every scalping cycle: `ollama=0 heuristic=N` (queue
+  #     saturation + timeouts). Math:
+  #         300 tokens / 30-50 tok/s = 6-10s of generation tail
+  #         150 tokens / 30-50 tok/s = 3-5s of generation tail
+  #     Halving the cap roughly halves the long-tail wait per call,
+  #     which both clears the queue faster AND fits comfortably
+  #     under the new 15s fast_timeout. Deep/validator paths read
+  #     the same key but their longer timeouts absorb 150 tokens
+  #     trivially — no separate per-tier override needed.
+  num_predict: 150
   # Master kill-switch for the deep tier in the realtime path. The
   # April 2026 soak machine is currently CPU-only — `ollama serve`
   # logs `inference compute id=cpu` — so qwen2.5:7b takes 20-45s
@@ -559,7 +588,22 @@ ollama:
   # Flip back to true once Ollama is running on GPU and a deep call
   # consistently completes under the 20s budget.
   deep_realtime_enabled: false
-  queue_depth_alert: 5
+  # Fast-tier queue depth above which `score_with_fallback` short-
+  # circuits to the keyword heuristic INSTEAD of queueing the call.
+  #
+  # Soak evidence (2026-04-26 PR #10/#11 soak, 3h):
+  #   - Scalping evaluates ~38 markets/cycle at fast tier. With
+  #     `fast_max_concurrent=2` and 10s/call, the queue crosses
+  #     depth=5 within the first ~5 markets.
+  #   - From that point, every remaining market in the cycle
+  #     short-circuited to heuristic. Result: every scan logged
+  #     `ollama=0 heuristic=N` — the all-or-nothing pattern.
+  #   - Bumping the alert to 15 lets calls actually queue and
+  #     drain rather than the lane discarding the whole batch.
+  #     Combined with the num_predict + timeout changes, the
+  #     queue depth should NEVER reach 15 in steady state — this
+  #     is the safety floor, not the operating point.
+  queue_depth_alert: 15
   # Per-tier in-flight caps. Each tier has its own asyncio.Semaphore so
   # a stuck deep call doesn't starve fast scoring. Legacy
   # ``max_concurrent_calls`` (kept below) is honored as the fast-tier
