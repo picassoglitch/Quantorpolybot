@@ -25,14 +25,21 @@ def temp_db(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_init_creates_three_lanes_with_correct_budgets():
+async def test_init_creates_lanes_with_correct_budgets():
     await allocator.init_lane_capital()
     states = {s.lane: s for s in await allocator.all_states()}
-    assert set(states.keys()) == {"scalping", "event_sniping", "longshot"}
-    # Default config: $10k * (0.60 / 0.30 / 0.10)
+    # Step #3 PR #1 added `breaking_event_scout` as a fourth lane.
+    # The conftest config still uses the legacy 3-lane allocations
+    # (no `breaking_event_scout` key), so its budget initialises to
+    # 0 — the lane is present but unfunded under the test fixture.
+    assert {"scalping", "event_sniping", "longshot"} <= set(states.keys())
+    assert "breaking_event_scout" in states
+    # Conftest config: $10k * (0.60 / 0.30 / 0.10) — unchanged for
+    # the original three lanes.
     assert states["scalping"].total_budget == pytest.approx(6000.0)
     assert states["event_sniping"].total_budget == pytest.approx(3000.0)
     assert states["longshot"].total_budget == pytest.approx(1000.0)
+    assert states["breaking_event_scout"].total_budget == pytest.approx(0.0)
     # All lanes start fully available.
     for s in states.values():
         assert s.deployed == 0

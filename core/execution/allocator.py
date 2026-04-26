@@ -33,7 +33,12 @@ from core.utils.config import get_config
 from core.utils.db import execute, fetch_all, fetch_one
 from core.utils.helpers import now_ts, safe_float
 
-LANES = ("scalping", "event_sniping", "longshot")
+# Step #3 PR #1 added `breaking_event_scout` as a fourth allocator
+# bucket. Pure addition — existing lanes keep their budgets; the
+# scout's lane allocation comes from a new line in
+# config.yaml's `shadow_capital.lane_allocations`. Real budget
+# stays 0; the scout is SHADOW-only in PR #1.
+LANES = ("scalping", "event_sniping", "longshot", "breaking_event_scout")
 MODES = ("shadow", "real")
 
 _RESERVE_LOCK = asyncio.Lock()

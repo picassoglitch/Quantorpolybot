@@ -9,6 +9,7 @@ from loguru import logger
 
 from core.feeds.enrich import NewsEnricher
 from core.feeds.fred import FredFeed
+from core.feeds.gdelt import GdeltFeed
 from core.feeds.google_news import GoogleNewsFeed
 from core.feeds.metaculus import MetaculusFeed
 from core.feeds.polymarket_news import PolymarketNewsFeed
@@ -33,6 +34,10 @@ class FeedManager:
             WikipediaFeed(),
             self.news_enricher,
             PredictItFeed(),
+            # Step #3 PR #1: GDELT scout signal source. Writes to
+            # `scout_signals`, NOT `feed_items` — see core/feeds/gdelt.py
+            # for the rationale (avoid double-LLM-scoring).
+            GdeltFeed(),
         ]
         self._tasks: list[asyncio.Task] = []
         self._stopping = False
