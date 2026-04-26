@@ -97,7 +97,13 @@ async def test_scalping_lane_enters_and_take_profit_exits(monkeypatch):
         )
 
     # Mock the slow/external calls: scoring, volume, and price snapshots.
-    async def fake_score(market, text, client=None, tier="deep"):
+    # Scalping switched from ``scoring.score`` to ``score_with_fallback``
+    # so that a stalled Ollama no longer zeros out the lane — the mock
+    # tracks the new entry point. Same return shape (Score), so the
+    # rest of the test is unchanged.
+    async def fake_score_with_fallback(
+        market, text, *, client=None, tier="fast", timeout_seconds=None,
+    ):
         return Score(true_prob=0.60, confidence=0.75, reasoning="mock", source="ollama")
 
     async def fake_volume(market_id):
@@ -116,7 +122,7 @@ async def test_scalping_lane_enters_and_take_profit_exits(monkeypatch):
             source="gamma",
         )
 
-    monkeypatch.setattr(scoring, "score", fake_score)
+    monkeypatch.setattr(scoring, "score_with_fallback", fake_score_with_fallback)
     monkeypatch.setattr(scalping, "volume_24h", fake_volume)
     monkeypatch.setattr(scalping, "current_price", fake_current_price)
     monkeypatch.setattr(scalping, "live_orderbook_snapshot", fake_live_orderbook)

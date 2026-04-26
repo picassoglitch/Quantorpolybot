@@ -40,8 +40,15 @@ _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 # After this many consecutive failures we enter a cooldown window during
 # which calls return None immediately instead of hammering a broken Ollama.
+# The threshold is now applied per-tier so a misconfigured deep model
+# can't put the fast tier into cooldown — see _record_failure().
 _FAIL_THRESHOLD = 5
 _COOLDOWN_SECONDS = 60.0
+
+# Tier identifiers used as keys for per-tier semaphores, queue counters,
+# and cooldown state. Centralised so adding a new tier is a one-line
+# change instead of N scattered string literals.
+_TIERS: tuple[str, ...] = ("fast", "deep", "validator")
 
 
 def _ollama_cfg() -> dict[str, Any]:
@@ -63,31 +70,64 @@ _CLIENT_LOCK = asyncio.Lock()
 # from WARN to ERROR.
 LAST_SUCCESS_TS: float = 0.0
 
-# Process-wide in-flight cap. Ollama on a single-GPU box (8 GB VRAM,
-# one model loaded) can only physically decode ~1-2 requests at a time;
+# Per-tier in-flight cap. Ollama on a single-GPU box (8 GB VRAM, one
+# model loaded) can only physically decode ~1-2 requests at a time;
 # beyond that, extra concurrent HTTP requests either queue inside Ollama
 # (wasting client-side timeouts) or — worse, on Windows — pile up in the
 # kernel accept backlog and surface as httpx ConnectTimeouts even though
-# the server is healthy. A module-level semaphore forces client-side
-# serialization that matches the GPU's real throughput. Read from config
-# so it scales on larger machines without a code change.
-_GLOBAL_SEM: asyncio.Semaphore | None = None
+# the server is healthy.
+#
+# We split the in-flight budget per tier so a stuck deep call (60s budget)
+# doesn't starve fast calls (45s budget) waiting on a single shared slot.
+# Without this, two stalled deep calls on a 2-slot global semaphore make
+# every fast call burn its own wait_for budget queueing for a slot — the
+# GPU isn't busy, the client is. Independent per-tier slots let the fast
+# tier keep firing while a deep stall is in flight.
+#
+# Defaults: fast=2 (overlap one decoding + one prompt upload), deep=1,
+# validator=1. Total nominal concurrency is 4 but each tier serialises
+# against its own contention, which matches the GPU's real throughput.
+# Legacy ``max_concurrent_calls`` is honored as the fast-tier default
+# when the per-tier keys are absent so existing configs keep working.
+_TIER_SEMS: dict[str, asyncio.Semaphore] = {}
 _SEM_LOCK = asyncio.Lock()
 
+_TIER_SEM_DEFAULTS: dict[str, int] = {
+    "fast": 2,
+    "deep": 1,
+    "validator": 1,
+}
 
-async def _get_global_semaphore() -> asyncio.Semaphore:
-    global _GLOBAL_SEM
-    if _GLOBAL_SEM is not None:
-        return _GLOBAL_SEM
+
+def _tier_concurrency(tier: str) -> int:
+    cfg = _ollama_cfg()
+    key = f"{tier}_max_concurrent"
+    raw = cfg.get(key)
+    if raw is None and tier == "fast":
+        # Backwards-compat: respect the single ``max_concurrent_calls``
+        # key on the fast tier (most callers are fast-tier today).
+        raw = cfg.get("max_concurrent_calls")
+    n = int(raw) if raw is not None else _TIER_SEM_DEFAULTS.get(tier, 1)
+    return n if n >= 1 else 1
+
+
+async def _get_tier_semaphore(tier: str) -> asyncio.Semaphore:
+    sem = _TIER_SEMS.get(tier)
+    if sem is not None:
+        return sem
     async with _SEM_LOCK:
-        if _GLOBAL_SEM is None:
-            # Default 2: one call decoding on the GPU while the next is
-            # uploading its prompt. Higher values just queue internally.
-            n = int(_ollama_cfg().get("max_concurrent_calls", 2))
-            if n < 1:
-                n = 1
-            _GLOBAL_SEM = asyncio.Semaphore(n)
-    return _GLOBAL_SEM
+        sem = _TIER_SEMS.get(tier)
+        if sem is None:
+            sem = asyncio.Semaphore(_tier_concurrency(tier))
+            _TIER_SEMS[tier] = sem
+    return sem
+
+
+def _reset_tier_semaphores() -> None:
+    """Drop cached per-tier semaphores. Called when concurrency settings
+    change so the new caps take effect on the next call instead of after
+    a process restart. Tests also reach in here directly."""
+    _TIER_SEMS.clear()
 
 
 def _build_shared_client() -> httpx.AsyncClient:
@@ -149,8 +189,14 @@ class OllamaClient:
             get_config().get("signals", "ollama_timeout_seconds", default=60)
         )
         self._default_timeout = legacy_timeout
-        self._consecutive_failures = 0
-        self._cooldown_until = 0.0
+        # Per-tier cooldown state. A run of failures on the deep tier
+        # (e.g. operator typo'd the deep_model name) used to trip the
+        # whole client into cooldown for 60s, which silently blocked
+        # fast-tier scoring even though that tier's model was healthy.
+        # Tracking failures per tier isolates the back-off so the fast
+        # path keeps firing while only deep is in cooldown.
+        self._consecutive_failures: dict[str, int] = {t: 0 for t in _TIERS}
+        self._cooldown_until: dict[str, float] = {t: 0.0 for t in _TIERS}
         # Per-model set so switching via the dashboard re-arms the warning
         # for whichever model is currently missing.
         self._missing_models_warned: set[str] = set()
@@ -162,11 +208,13 @@ class OllamaClient:
     def _reset_global_cooldowns(cls) -> None:
         """Clear back-off state on every live client. Called by the
         Settings page after the user updates OLLAMA_* env vars so the new
-        config gets tried immediately."""
+        config gets tried immediately. Also drops the cached per-tier
+        semaphores so adjusted concurrency caps take effect at once."""
         for inst in list(cls._instances):
-            inst._consecutive_failures = 0
-            inst._cooldown_until = 0.0
+            inst._consecutive_failures = {t: 0 for t in _TIERS}
+            inst._cooldown_until = {t: 0.0 for t in _TIERS}
             inst._missing_models_warned = set()
+        _reset_tier_semaphores()
 
     @classmethod
     def queue_depths(cls) -> dict[str, int]:
@@ -252,20 +300,21 @@ class OllamaClient:
 
     # ---- Back-off plumbing -------------------------------------------
 
-    def _in_cooldown(self) -> bool:
-        return time.monotonic() < self._cooldown_until
+    def _in_cooldown(self, tier: str = "deep") -> bool:
+        return time.monotonic() < self._cooldown_until.get(tier, 0.0)
 
-    def _record_success(self) -> None:
-        self._consecutive_failures = 0
-        self._cooldown_until = 0.0
+    def _record_success(self, tier: str = "deep") -> None:
+        self._consecutive_failures[tier] = 0
+        self._cooldown_until[tier] = 0.0
 
-    def _record_failure(self) -> None:
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= _FAIL_THRESHOLD:
-            self._cooldown_until = time.monotonic() + _COOLDOWN_SECONDS
+    def _record_failure(self, tier: str = "deep") -> None:
+        self._consecutive_failures[tier] = self._consecutive_failures.get(tier, 0) + 1
+        if self._consecutive_failures[tier] >= _FAIL_THRESHOLD:
+            self._cooldown_until[tier] = time.monotonic() + _COOLDOWN_SECONDS
             logger.warning(
-                "[ollama] {} consecutive failures; pausing calls for {:.0f}s",
-                self._consecutive_failures,
+                "[ollama] tier={} {} consecutive failures; pausing this tier for {:.0f}s",
+                tier,
+                self._consecutive_failures[tier],
                 _COOLDOWN_SECONDS,
             )
 
@@ -313,14 +362,31 @@ class OllamaClient:
         elif call_type == "deep":
             cls.pending_deep = max(0, cls.pending_deep - 1)
 
+    @classmethod
+    def _queue_for(cls, call_type: str) -> int:
+        if call_type == "fast":
+            return cls.pending_fast
+        if call_type == "validator":
+            return cls.pending_validator
+        if call_type == "deep":
+            return cls.pending_deep
+        return 0
+
     async def _generate(
         self,
         prompt: str,
         *,
         call_type: str,
         response_format: str = "json",
+        tag: str = "",
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         """Single Ollama /api/generate call with stats logging.
+
+        ``tag`` is an opaque caller-supplied label (typically a market_id
+        or "pipeline:<feed_id>") that flows into the per-call log line so
+        operator triage can map a slow latency back to the originating
+        market without grep'ing across modules. It does NOT affect the
+        request body or the stats row.
 
         Returns (parsed_body, meta) where ``meta`` always contains at
         least {"raw_text", "latency_ms", "success", "error"} so the
@@ -339,8 +405,11 @@ class OllamaClient:
             "tokens_in": 0,
             "tokens_out": 0,
         }
-        if self._in_cooldown():
+        if self._in_cooldown(call_type):
             meta["error"] = "cooldown"
+            logger.debug(
+                "[ollama] tier={} skipped (cooldown) tag={}", call_type, tag or "-",
+            )
             await self._log_stat(meta)
             return None, meta
 
@@ -366,12 +435,17 @@ class OllamaClient:
         start = time.perf_counter()
         OllamaClient._inc(call_type)
         client = await _get_shared_client()
-        sem = await _get_global_semaphore()
+        sem = await _get_tier_semaphore(call_type)
+        # Snapshot queue depth for the log line — taken before the wait
+        # so the operator sees how saturated the tier was at dispatch
+        # time, not after the call drained.
+        queue_depth_at_call = OllamaClient._queue_for(call_type)
         try:
-            # Serialize against Ollama's real throughput (see _GLOBAL_SEM
-            # docs). The wait here is bounded by the tier timeout — if a
-            # slot doesn't free up in time, we fail fast rather than pile
-            # up TCP connections the server can't accept.
+            # Serialize against Ollama's real per-tier throughput (see
+            # _TIER_SEMS docs). A stuck deep call no longer holds a slot
+            # the fast tier needs. The wait here is bounded by the tier
+            # timeout — if a slot doesn't free up in time, we fail fast
+            # rather than pile up TCP connections the server can't accept.
             async with sem:
                 # Per-call wait_for wraps the shared client's post so each
                 # tier keeps its own budget — the shared client's read
@@ -385,11 +459,13 @@ class OllamaClient:
             meta["latency_ms"] = (time.perf_counter() - start) * 1000.0
             meta["error"] = type(e).__name__
             logger.debug(
-                "[ollama] tier={} model={} latency_ms={:.0f} success=false error={}",
-                call_type, model, meta["latency_ms"], type(e).__name__,
+                "[ollama] tier={} model={} tag={} latency_ms={:.0f} "
+                "queue_depth={} success=false error={}",
+                call_type, model, tag or "-", meta["latency_ms"],
+                queue_depth_at_call, type(e).__name__,
             )
             self._explain_failure(e, model)
-            self._record_failure()
+            self._record_failure(call_type)
             await self._log_stat(meta)
             return None, meta
         finally:
@@ -400,7 +476,7 @@ class OllamaClient:
         # Ollama returns prompt_eval_count / eval_count when available.
         meta["tokens_in"] = int(data.get("prompt_eval_count") or 0)
         meta["tokens_out"] = int(data.get("eval_count") or 0)
-        self._record_success()
+        self._record_success(call_type)
         global LAST_SUCCESS_TS
         LAST_SUCCESS_TS = time.time()
 
@@ -408,10 +484,10 @@ class OllamaClient:
         meta["raw_text"] = text
         parsed = self._extract_json(text) if response_format == "json" else None
         logger.debug(
-            "[ollama] tier={} model={} latency_ms={:.0f} success=true "
-            "tokens_in={} tokens_out={}",
-            call_type, model, meta["latency_ms"],
-            meta["tokens_in"], meta["tokens_out"],
+            "[ollama] tier={} model={} tag={} latency_ms={:.0f} "
+            "queue_depth={} success=true tokens_in={} tokens_out={}",
+            call_type, model, tag or "-", meta["latency_ms"],
+            queue_depth_at_call, meta["tokens_in"], meta["tokens_out"],
         )
         await self._log_stat(meta)
         return parsed, meta
@@ -449,40 +525,54 @@ class OllamaClient:
     # ---- Public tiered API -------------------------------------------
 
     async def fast_score(
-        self, prompt: str, *, context: dict[str, Any] | None = None,
+        self,
+        prompt: str,
+        *,
+        context: dict[str, Any] | None = None,
+        tag: str = "",
     ) -> dict[str, Any] | None:
         """Small-model JSON scoring. Target <5s. Used by event_sniper
         and scalping re-scores."""
-        parsed, _ = await self._generate(prompt, call_type="fast")
+        parsed, _ = await self._generate(prompt, call_type="fast", tag=tag)
         return parsed
 
     async def deep_score(
-        self, prompt: str, *, context: dict[str, Any] | None = None,
+        self,
+        prompt: str,
+        *,
+        context: dict[str, Any] | None = None,
+        tag: str = "",
     ) -> dict[str, Any] | None:
         """Mid-model JSON scoring. Target 10-30s. Used by signal
         pipeline and longshot."""
-        parsed, _ = await self._generate(prompt, call_type="deep")
+        parsed, _ = await self._generate(prompt, call_type="deep", tag=tag)
         return parsed
 
     async def validate(
-        self, prompt: str, *, context: dict[str, Any] | None = None,
+        self,
+        prompt: str,
+        *,
+        context: dict[str, Any] | None = None,
+        tag: str = "",
     ) -> dict[str, Any] | None:
         """Cross-validation model. Low temperature, no exploration —
         used by shadow.open_position on entries >= high-stakes threshold."""
-        parsed, _ = await self._generate(prompt, call_type="validator")
+        parsed, _ = await self._generate(prompt, call_type="validator", tag=tag)
         return parsed
 
     # ---- Legacy API (kept for backward compat) -----------------------
 
-    async def generate_json(self, prompt: str) -> dict[str, Any] | None:
+    async def generate_json(
+        self, prompt: str, *, tag: str = "",
+    ) -> dict[str, Any] | None:
         """Legacy entry point. Routes to the deep tier — callers that
         haven't been migrated to fast/validator get sensible defaults."""
-        return await self.deep_score(prompt)
+        return await self.deep_score(prompt, tag=tag)
 
     async def generate_text(self, prompt: str) -> str:
         """Freeform (non-JSON) generation. Used by prompt evolution.
         Always goes to the deep tier at a slightly warmer temperature."""
-        if self._in_cooldown():
+        if self._in_cooldown("deep"):
             return ""
         url = f"{self.host}/api/generate"
         model = self.deep_model
@@ -508,7 +598,7 @@ class OllamaClient:
         }
         start = time.perf_counter()
         client = await _get_shared_client()
-        sem = await _get_global_semaphore()
+        sem = await _get_tier_semaphore("deep")
         try:
             async with sem:
                 r = await asyncio.wait_for(
@@ -520,14 +610,14 @@ class OllamaClient:
             meta["latency_ms"] = (time.perf_counter() - start) * 1000.0
             meta["error"] = type(e).__name__
             self._explain_failure(e, model)
-            self._record_failure()
+            self._record_failure("deep")
             await self._log_stat(meta)
             return ""
         meta["latency_ms"] = (time.perf_counter() - start) * 1000.0
         meta["success"] = True
         meta["tokens_in"] = int(data.get("prompt_eval_count") or 0)
         meta["tokens_out"] = int(data.get("eval_count") or 0)
-        self._record_success()
+        self._record_success("deep")
         global LAST_SUCCESS_TS
         LAST_SUCCESS_TS = time.time()
         await self._log_stat(meta)

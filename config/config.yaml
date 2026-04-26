@@ -328,6 +328,12 @@ signals:
   min_keyword_overlap: 0.05
   market_rescore_cooldown_seconds: 180
   max_candidate_days: 365
+  # Per-pipeline-call cap on parallel ``build_market_context`` lookups.
+  # Each lookup opens 3 aiosqlite connections (price/news/peers); with
+  # ~25 candidates the unbounded fan-out fights WAL serialization and
+  # contributes to the watchdog-observed loop stalls. 5 covers >95% of
+  # feed items in practice.
+  context_top_k: 5
 ollama:
   host: http://localhost:11434
   model: qwen2.5:7b-instruct-q4_K_M
@@ -341,6 +347,14 @@ ollama:
   deep_temperature: 0.3
   validator_temperature: 0.1
   queue_depth_alert: 5
+  # Per-tier in-flight caps. Each tier has its own asyncio.Semaphore so
+  # a stuck deep call doesn't starve fast scoring. Legacy
+  # ``max_concurrent_calls`` (kept below) is honored as the fast-tier
+  # default when ``fast_max_concurrent`` is missing — that's the only
+  # backwards-compat path; deep/validator always use the new keys.
+  fast_max_concurrent: 2
+  deep_max_concurrent: 1
+  validator_max_concurrent: 1
   max_concurrent_calls: 2
   validator_high_stakes_usd: 10
   validator_max_prob_drift: 0.15

@@ -265,14 +265,35 @@ class SignalPipeline:
         # about price trajectory / peer signals / news frequency per market
         # — not just the news text in isolation. Best-effort: any failure
         # gives an empty dict for that market so the prompt still renders.
+        #
+        # Cap the parallel fan-out: each ``build_market_context`` opens 3
+        # aiosqlite connections (price trajectory + recent news count +
+        # peer signals). With 25 candidates per pipeline call, that's 75
+        # concurrent connections fighting WAL serialization, which was
+        # one of the contributors to the watchdog-observed loop stalls.
+        # Top-K is configurable so this can be tuned without a code
+        # change; 5 covers >95% of feed items in practice (the candidate
+        # scorer only rarely produces more than a handful of strong matches).
+        ctx_top_k = int(
+            get_config().get("signals", "context_top_k", default=5)
+        )
+        if ctx_top_k > 0 and len(markets) > ctx_top_k:
+            head, tail = markets[:ctx_top_k], markets[ctx_top_k:]
+        else:
+            head, tail = list(markets), []
         contexts = await asyncio.gather(
-            *(build_market_context(m.market_id) for m in markets),
+            *(build_market_context(m.market_id) for m in head),
             return_exceptions=True,
         )
-        ctx_map = {
-            m.market_id: (c if isinstance(c, dict) else {})
-            for m, c in zip(markets, contexts)
-        }
+        ctx_map: dict[str, dict[str, Any]] = {}
+        for m, c in zip(head, contexts):
+            ctx_map[m.market_id] = c if isinstance(c, dict) else {}
+        for m in tail:
+            # Tail markets get an empty context dict so the prompt still
+            # serializes them — the LLM just won't have price/news/peer
+            # context for those candidates. They're the lowest-scoring
+            # heuristic matches anyway.
+            ctx_map[m.market_id] = {}
         context_json = json.dumps(ctx_map, ensure_ascii=False)
         # Use .replace() not .format() — the prompt template contains a literal
         # JSON schema example with {} braces that would otherwise blow up
@@ -283,8 +304,36 @@ class SignalPipeline:
             .replace("{candidates}", candidates_json)
             .replace("{context}", context_json)
         )
-        result = await self._ollama.generate_json(prompt)
+        result = await self._ollama.generate_json(
+            prompt, tag=f"pipeline:{int(item['id'])}",
+        )
         if not result:
+            # Ollama unavailable (cooldown / timeout / unparseable). The
+            # pipeline used to silently return here, which made a
+            # degraded LLM look identical to "no candidate matched" in
+            # the signals table. Persist a row so the dashboard /
+            # operator triage can tell the difference and so feed items
+            # aren't re-processed forever (the cursor only advances when
+            # _process_item returns).
+            top_mid = str(markets[0].market_id) if markets else None
+            await execute(
+                """INSERT INTO signals
+                (feed_item_id, market_id, implied_prob, confidence, edge,
+                 mid_price, side, size_usd, reasoning, prompt_version,
+                 created_at, status)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    int(item["id"]),
+                    top_mid,
+                    0.0, 0.0, 0.0, 0.0,
+                    "NONE",
+                    0.0,
+                    "ollama_unavailable: deep call returned no parseable JSON",
+                    prompt_version,
+                    now_ts(),
+                    "ollama_unavailable",
+                ),
+            )
             return
         market_id = result.get("market_id")
         if not market_id or market_id == "null":
