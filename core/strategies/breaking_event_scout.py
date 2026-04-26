@@ -168,6 +168,13 @@ class BreakingEventScoutLane:
             "observed": 0,
             "no_mapping": 0,
         }
+        # v3.1 instrumentation: bucket reject reasons so the operator
+        # can see WHY rejects are happening post-threshold-fix without
+        # grepping every individual reject line. Buckets are coarse
+        # (corroboration / low_severity / polarity_unknown / low_edge /
+        # low_confidence / cooldown / safety / other) — fine-grained
+        # reason strings still appear on the per-reject INFO log line.
+        rejected_breakdown: dict[str, int] = {}
 
         # ---- 1. Pull new scout signals ----
         rows = await fetch_all(
@@ -218,13 +225,19 @@ class BreakingEventScoutLane:
                 continue
             counts["mapped"] += len(matches)
             for match in matches:
-                outcome = await self._evaluate_and_maybe_open(event, match)
+                outcome, reason = await self._evaluate_and_maybe_open(
+                    event, match,
+                )
                 if outcome == "accepted":
                     counts["accepted"] += 1
                 elif outcome == "observed":
                     counts["observed"] += 1
                 else:
                     counts["rejected"] += 1
+                    bucket = _bucket_reject_reason(reason, event)
+                    rejected_breakdown[bucket] = (
+                        rejected_breakdown.get(bucket, 0) + 1
+                    )
 
         # Advance cursor only after a successful pass — partial
         # failures keep the unprocessed signals in scope for next
@@ -232,12 +245,19 @@ class BreakingEventScoutLane:
         self._cursor_id = max(int(r["id"]) for r in rows)
 
         if counts["events_new"] > 0:
+            # Format the breakdown as "k1=v1, k2=v2 …" sorted by name
+            # so the same buckets land in the same order across cycles
+            # — easier to grep / diff in tail -f.
+            breakdown_str = ", ".join(
+                f"{k}={v}" for k, v in sorted(rejected_breakdown.items())
+            ) or "none"
             logger.info(
                 "[scout] scan signals={} events_new={} mapped={} "
-                "accepted={} observed={} rejected={} no_mapping={}",
+                "accepted={} observed={} rejected={} no_mapping={} "
+                "rejected_breakdown=[{}]",
                 counts["signals"], counts["events_new"], counts["mapped"],
                 counts["accepted"], counts["observed"], counts["rejected"],
-                counts["no_mapping"],
+                counts["no_mapping"], breakdown_str,
             )
         return counts
 
@@ -306,17 +326,21 @@ class BreakingEventScoutLane:
 
     async def _evaluate_and_maybe_open(
         self, event: Event, match: scout_mapper.MarketMatch,
-    ) -> str:
+    ) -> tuple[str, str]:
         """Score impact, run the safety gate, and open a SHADOW
         position if accepted.
 
-        Returns one of:
+        Returns ``(outcome, reason)`` where ``outcome`` is one of:
           - ``"accepted"`` — SHADOW position was opened
           - ``"observed"`` — scout noticed the event but no polarity
             rule fired; row persisted with ``status="observed"``,
             no trade
           - ``"rejected"`` — failed a safety/edge/confidence gate;
             row persisted with ``status="rejected"`` and a reason
+
+        ``reason`` is the decision.reason string for "rejected"
+        outcomes (used by the cycle log to bucket reject causes),
+        empty for "accepted"/"observed".
         """
         # Get a fresh price snapshot — the cached market.mid may be
         # stale by minutes; for breaking-news entries that's the
@@ -359,7 +383,7 @@ class BreakingEventScoutLane:
                 event.event_id, match.market.market_id,
                 event.severity, match.score,
             )
-            return "observed"
+            return "observed", ""
         if not decision.accepted:
             logger.info(
                 "[scout] reject event={} market={} side={} edge={:.3f} "
@@ -367,7 +391,7 @@ class BreakingEventScoutLane:
                 event.event_id, match.market.market_id,
                 decision.side or "-", decision.edge, decision.reason,
             )
-            return "rejected"
+            return "rejected", decision.reason
 
         # Lane state checks before reserving capital.
         state = await allocator.get_state(LANE)
@@ -377,7 +401,7 @@ class BreakingEventScoutLane:
                 "skipping open",
                 event.event_id, match.market.market_id,
             )
-            return "rejected"
+            return "rejected", "lane_paused_or_missing"
 
         size_usd = await _position_size(decision.confidence, _cfg())
         # v3: apply the high-sev-solo size multiplier (0.30x by
@@ -401,7 +425,7 @@ class BreakingEventScoutLane:
                 "(wanted={:.2f})",
                 event.event_id, match.market.market_id, size_usd,
             )
-            return "rejected"
+            return "rejected", "allocator_denied"
 
         if snap is None or snap.mid <= 0:
             await allocator.release(LANE, approved, 0.0)
@@ -409,7 +433,7 @@ class BreakingEventScoutLane:
                 "[scout] event={} market={} no live snapshot at open time",
                 event.event_id, match.market.market_id,
             )
-            return "rejected"
+            return "rejected", "no_snapshot_at_open"
 
         pos_id = await shadow.open_position(
             strategy=LANE,
@@ -446,7 +470,7 @@ class BreakingEventScoutLane:
                 "[scout] open_position returned None for event={} market={}",
                 event.event_id, match.market.market_id,
             )
-            return "rejected"
+            return "rejected", "open_position_returned_none"
 
         await scout_candidate.attach_position(decision.audit_row_id, pos_id)
         logger.info(
@@ -455,7 +479,120 @@ class BreakingEventScoutLane:
             event.event_id, match.market.market_id, decision.side,
             approved, decision.edge, decision.confidence,
         )
-        return "accepted"
+        return "accepted", ""
+
+
+def polarity_confirms_solo(
+    event: "Event",
+    impact: "Any",
+    market_side: str,
+    *,
+    min_confidence: float = 0.7,
+    cfg: dict[str, Any] | None = None,
+) -> bool:
+    """Stub for the planned second corroboration override path.
+
+    *** NOT wired into the candidate evaluator yet. ***
+
+    Concept: even when an event has source_count=1 AND no primary
+    source AND severity is below the high_sev_solo_threshold, we
+    still have a second independent signal — the LLM's polarity
+    inference. If the LLM call returned a definite direction
+    (BUY / SELL, not unclear) AND that direction agrees with the
+    market_side the candidate evaluator would have taken AND the
+    LLM-side confidence is above ``min_confidence``, that's
+    independent corroboration of the trade direction even from a
+    single primary news source.
+
+    Returns True only when ALL of the following hold:
+      - cfg.llm_polarity_confirms_solo_enabled is True (default OFF)
+      - impact.polarity_source == "llm" (the direction came from an
+        actual LLM call, not the rule table or a fallback)
+      - impact.direction != 0 (LLM returned a definite call)
+      - impact.confidence >= min_confidence (LLM was sure enough)
+      - sign(impact.direction) matches market_side ("BUY" → +1,
+        "SELL" → -1)
+
+    The candidate evaluator will eventually wire this as a SECOND
+    override path alongside ``high_sev_solo`` — same size_multiplier
+    treatment, all other safety gates (cooldown / max_exposure /
+    age / spread / edge / confidence) still run normally.
+
+    Why a stub now: the v3.1 threshold-fix soak hasn't been run
+    yet. Wiring this before we know the threshold fix is stable
+    would conflate two corroboration overrides in the same audit
+    trail. We enable after the threshold-fix soak proves stable
+    AND the LLM polarity path is producing useful direction calls
+    (visible in event_market_candidates.impact_snapshot.impact.
+    polarity_source = 'llm' rows).
+    """
+    cfg = cfg or {}
+    if not bool(cfg.get("llm_polarity_confirms_solo_enabled", False)):
+        return False
+    if impact is None:
+        return False
+    polarity_source = getattr(impact, "polarity_source", "")
+    if polarity_source != "llm":
+        return False
+    direction = getattr(impact, "direction", 0)
+    if direction == 0:
+        return False
+    confidence = float(getattr(impact, "confidence", 0.0) or 0.0)
+    if confidence < float(min_confidence):
+        return False
+    expected_dir = +1 if market_side == "BUY" else -1
+    return direction == expected_dir
+
+
+def _bucket_reject_reason(reason: str, event: Event) -> str:
+    """Coarse-grained bucket name for the scout cycle log.
+
+    The candidate evaluator emits long human-readable reject reasons
+    ("insufficient corroboration: source_count=1 < 2 ...",
+    "polarity_unknown: no polarity rules for category=election_result",
+    "edge 0.030 < min_edge 0.050", etc.). Greppy buckets here let the
+    operator see at a glance which gate is dominant in each cycle
+    without parsing every individual reject line.
+
+    Order matters — more-specific buckets first, fall through to
+    "other" at the end.
+
+    Special-case: when the reason is "polarity_unknown ..." AND the
+    event severity is below the observed-mode floor, the reject is
+    really a low-severity drop (the lane couldn't even surface it as
+    observed). Bucket it as ``low_severity`` so the operator can tell
+    "rules don't know what to do" apart from "we discarded the
+    signal as too weak to consider".
+    """
+    from core.scout.impact import _OBSERVED_MIN_SEVERITY  # local import: avoid scout pkg cycle
+    r = reason or ""
+    if "corroboration" in r:
+        return "corroboration"
+    if "polarity_unknown" in r or "polarity unknown" in r:
+        if event.severity < _OBSERVED_MIN_SEVERITY:
+            return "low_severity"
+        return "polarity_unknown"
+    if "edge " in r and " < " in r:
+        return "low_edge"
+    if "confidence " in r and " < " in r:
+        return "low_confidence"
+    if "cooldown" in r:
+        return "cooldown"
+    if "too old" in r:
+        return "too_old"
+    if "spread " in r:
+        return "spread"
+    if "liquidity " in r or "min liquidity" in r:
+        return "liquidity"
+    if "lane_paused" in r:
+        return "lane_paused"
+    if "allocator_denied" in r:
+        return "allocator_denied"
+    if r.startswith("invalid mid"):
+        return "invalid_mid"
+    if not r:
+        return "other"
+    return "other"
 
 
 async def _position_size(confidence: float, cfg: dict[str, Any]) -> float:
