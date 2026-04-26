@@ -540,6 +540,16 @@ markets:
   max_pages: 30
   page_delay_seconds: 0.1
   active_only: true
+  # Wall-clock budget for one full pagination loop. The default in
+  # core/markets/discovery.py was 30s, which on slow Gamma responses
+  # (3-5s per page observed April 2026) capped pagination at 5-8
+  # pages and saw only ~300-400 kept markets vs the ~840 target —
+  # the lane was running scalping over a fraction of the universe
+  # because the refresh kept timing out before pagination completed.
+  # 90s covers 15-20 pages even on slow responses; pagination is
+  # async httpx and the CPU-heavy filter is on a worker thread, so
+  # extending this budget does NOT add event-loop pressure.
+  refresh_total_budget_seconds: 90
 signals:
   candidates_per_item: 5
   ollama_timeout_seconds: 60
@@ -559,28 +569,39 @@ ollama:
   fast_model: qwen2.5:7b-instruct-q4_K_M
   deep_model: qwen2.5:7b-instruct-q4_K_M
   validator_model: llama3:8b-instruct-q8_0
-  # Hard wall-clock budgets enforced by ``asyncio.wait_for`` on the
-  # loop side. These are intentionally tight: every Ollama call now
-  # runs on a per-tier ThreadPoolExecutor (see core.signals.ollama_executor),
-  # so the worker thread is bounded by these timeouts and the loop
-  # never blocks on the network. April 2026 soak: 45/60/60 was too
-  # generous and let stalled deep calls eat 60+ seconds while the
-  # watchdog accumulated `event_loop_blocked` warnings. 10/20/20 was
-  # tighter than the GPU's natural latency for a healthy call but lets
-  # the heuristic fallback take over fast on a degraded server.
+  # loop side. Every Ollama call runs on a per-tier ThreadPoolExecutor
+  # (see core.signals.ollama_executor), so the worker thread is
+  # bounded by these timeouts and the loop never blocks on the
+  # network.
   #
-  # Soak evidence (2026-04-26 PR #10/#11 soak, 3h):
-  #   - One observed timeout: "tier=fast TIMEOUT wait_ms=10724
-  #     budget=10000ms overrun=724ms" — a healthy GPU call missed by
-  #     0.7s, not a hang.
-  #   - qwen2.5:7b q4_K_M GPU latency math: 1-3s first-token + 300
-  #     tokens / 30-50 tok/s = 9-10s end-to-end. The 10s budget was
-  #     structurally at the edge.
-  #   - 15s gives healthy calls breathing room without un-bounding;
-  #     pairs with the num_predict drop below to keep the worst case
-  #     well under 15s. Deep/validator unchanged — those have their
-  #     own latency profile.
-  fast_timeout_seconds: 15
+  # April 2026 progression (each step has soak evidence below):
+  #   - 45/60/60: too generous; stalled deep calls ate 60+ seconds
+  #     and the watchdog accumulated `event_loop_blocked` warnings.
+  #   - 10/20/20 (PR #11): ratcheted down to match the heuristic-
+  #     fallback posture, but 10s for fast turned out to be at the
+  #     edge of qwen2.5:7b's natural latency — single observed
+  #     timeout on the PR #10/#11 soak: "tier=fast TIMEOUT
+  #     wait_ms=10724 budget=10000ms overrun=724ms" — a healthy GPU
+  #     call missing by 0.7s, not a hang.
+  #   - 15/20/20 (PR #12): bumped 10→15 with the math
+  #         qwen2.5:7b q4_K_M = 1-3s first-token + 300 tokens /
+  #             30-50 tok/s = 9-10s end-to-end
+  #     paired with `num_predict: 150` (cap below) to halve the
+  #     long-tail generation. Removed the structural-edge case but
+  #     still left fast asymmetric to deep/validator (15 vs 20).
+  #   - 20/20/20 (PR #16, current): fast tier joined deep/validator
+  #     at 20s. The April 2026 post-PR-#12 soak still showed
+  #     intermittent "ollama timeout (>10.0s)" warnings on the
+  #     scalping rescore path because score_with_fallback(tier=
+  #     "fast") was being called without an explicit timeout — the
+  #     log line printed the budget at the time of the warning, not
+  #     the live config. Unifying at 20s removes the cross-tier
+  #     asymmetry, gives ~10s margin over natural latency, and the
+  #     heuristic-fallback branch still triggers on real hangs /
+  #     circuit-broken servers. Pinned in tests so a future config
+  #     rebase that reverts the value triggers a clear failure
+  #     rather than silently re-introducing the timeout flap.
+  fast_timeout_seconds: 20
   deep_timeout_seconds: 20
   validator_timeout_seconds: 20
   fast_temperature: 0.2
