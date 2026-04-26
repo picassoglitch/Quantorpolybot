@@ -368,7 +368,7 @@ ollama:
   #     evolution, news enrichment) where multi-second latency is OK.
   # Flip back to true once Ollama is running on GPU and a deep call
   # consistently completes under the 20s budget.
-  deep_realtime_enabled: false
+  deep_realtime_enabled: true
   queue_depth_alert: 5
   # Per-tier in-flight caps. Each tier has its own asyncio.Semaphore so
   # a stuck deep call doesn't starve fast scoring. Legacy
