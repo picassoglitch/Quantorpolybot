@@ -287,6 +287,60 @@ def test_classify_network_error_is_network():
 
 
 # ============================================================
+# query_invalid classification — GDELT validation errors
+# ============================================================
+
+
+def test_classify_timespan_too_short_is_query_invalid():
+    """The GDELT message that triggered the v3 fix. Must be classified
+    as `query_invalid` so the operator log shouts 'fix config' instead
+    of generic non_json."""
+    assert _classify_failure(
+        status_code=200, content_type="text/html; charset=utf-8",
+        body_excerpt="Timespan is too short. ",
+        exception_class="",
+    ) == "query_invalid"
+
+
+def test_classify_other_gdelt_validation_messages_are_query_invalid():
+    for body in (
+        "Timespan is invalid",
+        "Mode is invalid",
+        "Query is invalid",
+        "Format is invalid",
+        "Query must contain at least one keyword",
+    ):
+        assert _classify_failure(
+            status_code=200, content_type="text/html",
+            body_excerpt=body, exception_class="",
+        ) == "query_invalid", f"failed for body={body!r}"
+
+
+def test_classify_unrelated_html_body_is_non_json_not_query_invalid():
+    """A genuine HTML error page (CDN edge, etc.) should still be
+    classified as non_json, not as a config-bug query_invalid."""
+    assert _classify_failure(
+        status_code=200, content_type="text/html",
+        body_excerpt="<html><body>504 Gateway Timeout</body></html>",
+        exception_class="",
+    ) == "non_json"
+
+
+@pytest.mark.asyncio
+async def test_fetch_query_invalid_classified_via_response(monkeypatch):
+    """End-to-end: a GDELT 'Timespan is too short' response surfaces
+    as failure_mode=query_invalid in the GdeltFetchResult."""
+    body = b"Timespan is too short. "
+    _patch_client(monkeypatch, response=_MockResponse(
+        status_code=200, body=body, content_type="text/html; charset=utf-8",
+    ))
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
+    assert r.ok is False
+    assert r.failure_mode == "query_invalid"
+    assert "Timespan" in r.body_excerpt
+
+
+# ============================================================
 # _CategoryState backoff
 # ============================================================
 
@@ -336,6 +390,35 @@ def test_success_resets_state():
     assert s.next_retry_ts == 0.0
     assert s.is_ready(now=0.0) is True
     assert s.last_failure_mode == ""
+
+
+def test_query_invalid_jumps_straight_to_long_backoff():
+    """Spec: re-running the same broken query every cycle wastes
+    rate-limit budget. The first query_invalid failure should push
+    backoff to the long (30 min) bucket, not the 60s normal start."""
+    from core.feeds.gdelt import _QUERY_INVALID_BACKOFF_SECONDS
+    s = _CategoryState()
+    next_retry = s.record_failure(mode="query_invalid", status=200, now=1000.0)
+    assert next_retry - 1000.0 == _QUERY_INVALID_BACKOFF_SECONDS
+    assert s.is_ready(now=1000.0 + 60) is False
+    assert s.is_ready(now=next_retry) is True
+
+
+def test_query_invalid_does_not_compound_with_consecutive_failures():
+    """Even on the 5th query_invalid in a row, the backoff stays at
+    the long flat value — it's not exponentially compounding."""
+    from core.feeds.gdelt import _QUERY_INVALID_BACKOFF_SECONDS
+    s = _CategoryState()
+    last = 1000.0
+    for _ in range(5):
+        last = s.record_failure(mode="query_invalid", status=200, now=last)
+    # last - (1000 + 4 incremental nows) should still be the flat 30 min
+    # — but easier: assert the raw delay between the last failure's
+    # `now` and `next_retry`.
+    s2 = _CategoryState()
+    s2.consecutive_failures = 4  # pretend 4 prior fails
+    next_retry = s2.record_failure(mode="query_invalid", status=200, now=2000.0)
+    assert next_retry - 2000.0 == _QUERY_INVALID_BACKOFF_SECONDS
 
 
 # ============================================================

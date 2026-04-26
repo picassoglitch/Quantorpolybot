@@ -444,7 +444,13 @@ feeds:
     # (still through the rate limiter). A second timeout records
     # as failure.
     retry_on_timeout: true
-    timespan: 15min
+    # Bumped from 15min: GDELT rejects 15min for many query shapes
+    # with HTTP 200 + text/html body "Timespan is too short.". 1h
+    # works for every category we ship today. The connector also
+    # detects the validation message and tags the failure as
+    # `query_invalid` (with a long backoff) so future config errors
+    # surface as a loud "FIX config" log line.
+    timespan: 1h
     # Phase 1 — keep the active set small until proven stable.
     categories:
       - shooting

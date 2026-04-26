@@ -217,6 +217,28 @@ _TIMEOUT_RETRY_DELAY_SECONDS = 5.0
 # tagged log line.
 _RATE_LIMIT_PREFIX = "Please limit requests"
 
+# GDELT validation errors: when the API doesn't like the request shape
+# (timespan too short, query syntax invalid, mode unknown, etc.) it
+# returns HTTP 200 with text/html and a one-line plain-text error in
+# the body. Detected as the `query_invalid` failure mode so the
+# operator gets a clearly tagged "fix the config" log line, NOT a
+# generic non_json. The bot also applies a long backoff on
+# query_invalid (no point retrying the same broken query) — the
+# operator must change config to recover.
+_QUERY_INVALID_PHRASES: tuple[str, ...] = (
+    "Timespan is too short",
+    "Timespan is invalid",
+    "Mode is invalid",
+    "Query is invalid",
+    "Format is invalid",
+    "must contain at least",  # GDELT's "query too broad" message
+)
+
+# Long backoff (30 min) for query_invalid — re-running the same broken
+# query under exponential backoff would waste rate-limit budget every
+# cycle for no benefit. Force the operator to look at the log.
+_QUERY_INVALID_BACKOFF_SECONDS = 30 * 60.0
+
 # Tier-1 / tier-2 domain reputation tables. Confidence prior for
 # parsed articles. Conservative — easier to add reputable domains
 # over time than to retract trust.
@@ -315,11 +337,14 @@ def _classify_failure(
     if status_code and 500 <= status_code < 600:
         return "server_error"
     if status_code == 200 and "json" not in content_type.lower():
-        # Most common 200-but-not-json case for GDELT is the rate-limit
-        # text body served with status 200 in some configurations, or
-        # an HTML error page from a CDN edge. Detect explicitly.
+        # Most common 200-but-not-json cases for GDELT, in priority
+        # order: rate-limit text body (served with status 200 in some
+        # routes), validation errors ("Timespan is too short.",
+        # "Mode is invalid.", etc.), HTML error pages from a CDN edge.
         if body_excerpt.startswith(_RATE_LIMIT_PREFIX):
             return "rate_limit"
+        if _looks_like_query_invalid(body_excerpt):
+            return "query_invalid"
         return "non_json"
     if status_code == 200:
         return "json_decode"
@@ -328,11 +353,23 @@ def _classify_failure(
     return "unknown"
 
 
+def _looks_like_query_invalid(body_excerpt: str) -> bool:
+    """True when the body matches one of GDELT's documented validation
+    error messages. Case-sensitive on the leading capital — these
+    messages are stable in GDELT's response."""
+    if not body_excerpt:
+        return False
+    for phrase in _QUERY_INVALID_PHRASES:
+        if phrase in body_excerpt:
+            return True
+    return False
+
+
 async def _fetch_gdelt(
     query: str,
     *,
     max_records: int = 50,
-    timespan: str = "15min",
+    timespan: str = "1h",
     timeout_connect: float = 20.0,
     timeout_read: float = 30.0,
     user_agent: str = "Quantorpolybot/0.1 (scout)",
@@ -547,14 +584,25 @@ class _CategoryState:
 
     def record_failure(self, *, mode: str, status: int, now: float) -> float:
         """Apply exponential backoff. Returns the new next_retry_ts so
-        the caller can log it."""
+        the caller can log it.
+
+        Special-case: ``mode == "query_invalid"`` jumps straight to
+        the long backoff (30 min). Re-running the same broken query
+        every cycle wastes the IP's rate-limit budget for no benefit
+        — the operator must change config to recover. The long
+        backoff also makes the failure stand out in the log when it
+        recurs.
+        """
         self.consecutive_failures += 1
         self.last_failure_mode = mode
         self.last_status = status
-        delay = min(
-            _BACKOFF_BASE_SECONDS * (2 ** (self.consecutive_failures - 1)),
-            _BACKOFF_CAP_SECONDS,
-        )
+        if mode == "query_invalid":
+            delay = _QUERY_INVALID_BACKOFF_SECONDS
+        else:
+            delay = min(
+                _BACKOFF_BASE_SECONDS * (2 ** (self.consecutive_failures - 1)),
+                _BACKOFF_CAP_SECONDS,
+            )
         self.next_retry_ts = now + delay
         return self.next_retry_ts
 
@@ -808,13 +856,29 @@ class GdeltFeed:
                     status=result.status_code,
                     now=now_t,
                 )
-                logger.warning(
-                    "[gdelt] category={} {} backoff={:.0f}s consecutive={} "
-                    "limiter_interval={:.1f}s",
-                    category.value, result.diagnostic(),
-                    next_retry - now_t, state.consecutive_failures,
-                    GLOBAL_LIMITER.current_interval_seconds,
-                )
+                if result.failure_mode == "query_invalid":
+                    # Loud + actionable: this is a config bug, not a
+                    # transient network blip. Suggest the most common
+                    # remedy in the same line so the operator doesn't
+                    # have to grep docs.
+                    logger.warning(
+                        "[gdelt] category={} {} backoff={:.0f}s "
+                        "consecutive={} limiter_interval={:.1f}s "
+                        "→ FIX config: GDELT rejected the request "
+                        "(check feeds.gdelt.timespan and the query "
+                        "string in core/feeds/gdelt.py)",
+                        category.value, result.diagnostic(),
+                        next_retry - now_t, state.consecutive_failures,
+                        GLOBAL_LIMITER.current_interval_seconds,
+                    )
+                else:
+                    logger.warning(
+                        "[gdelt] category={} {} backoff={:.0f}s consecutive={} "
+                        "limiter_interval={:.1f}s",
+                        category.value, result.diagnostic(),
+                        next_retry - now_t, state.consecutive_failures,
+                        GLOBAL_LIMITER.current_interval_seconds,
+                    )
                 fail += 1
             else:
                 state.record_success()
