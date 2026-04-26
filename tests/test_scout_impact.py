@@ -102,10 +102,10 @@ def test_unknown_polarity_with_low_severity_returns_zero_confidence():
     See tests/test_scout_impact_v2.py for the high-severity
     observed-mode path that was added in PR #7."""
     market = _market("Some unrelated market question", mid=0.50)
-    # Force severity below the observed-mode threshold (0.60) so
+    # Force severity below the v3.1 observed threshold (0.35) so
     # the scorer returns the true zero-signal shape, not the
     # observed-mode watchlist shape.
-    low_sev_event = _event(EventCategory.MACRO_DATA_SURPRISE, severity=0.40)
+    low_sev_event = _event(EventCategory.MACRO_DATA_SURPRISE, severity=0.30)
     impact = score_impact(low_sev_event, _match(market))
     assert impact.direction == 0
     assert impact.confidence == 0.0

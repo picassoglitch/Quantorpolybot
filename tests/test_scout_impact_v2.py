@@ -222,8 +222,9 @@ def test_observed_mode_when_high_severity_and_match_but_no_polarity():
 
 
 def test_not_observed_when_severity_below_threshold():
+    """severity 0.30 < 0.35 (v3.1 floor) → not observed."""
     market = _market("Will candidate X win the Q3 primary?")
-    low_sev = _event(EventCategory.ELECTION_RESULT, severity=0.40)
+    low_sev = _event(EventCategory.ELECTION_RESULT, severity=0.30)
     impact = score_impact(low_sev, _match(market, score=0.7))
     assert impact.direction == 0
     assert impact.observed is False
@@ -231,10 +232,11 @@ def test_not_observed_when_severity_below_threshold():
 
 
 def test_not_observed_when_match_score_below_threshold():
+    """match.score 0.15 < 0.20 (v3.1 floor) → not observed."""
     market = _market("Will candidate X win the Q3 primary?")
     impact = score_impact(
         _event(EventCategory.ELECTION_RESULT, severity=0.85),
-        _match(market, score=0.20),  # below the observed threshold
+        _match(market, score=0.15),  # below the observed threshold
     )
     assert impact.direction == 0
     assert impact.observed is False
@@ -243,10 +245,17 @@ def test_not_observed_when_match_score_below_threshold():
 
 def test_observed_thresholds_are_documented_constants():
     """Pin the constants in the test so a future loosening is
-    reviewed deliberately. Updated in v3 — was 0.60/0.30, now
-    0.50/0.25 to surface more events as observed candidates."""
-    assert _OBSERVED_MIN_SEVERITY == 0.50
-    assert _OBSERVED_MIN_MATCH_SCORE == 0.25
+    reviewed deliberately. History:
+      v2:    0.60 / 0.30
+      v3.0:  0.50 / 0.25
+      v3.1:  0.35 / 0.20 — single-source tier-3 GDELT events
+             cap at severity ~0.38 (SHOOTING) / ~0.45
+             (ASSASSINATION_ATTEMPT); v3.0 was unreachable in
+             practice. See test_scout_v3.py for the soak-driven
+             rationale.
+    """
+    assert _OBSERVED_MIN_SEVERITY == 0.35
+    assert _OBSERVED_MIN_MATCH_SCORE == 0.20
     assert _OBSERVED_CONFIDENCE == 0.20
 
 
