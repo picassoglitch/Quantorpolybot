@@ -416,27 +416,40 @@ feeds:
   # (NOT `feed_items` — see core/feeds/gdelt.py for why).
   #
   # Rate limit (REAL, hard): GDELT enforces "1 request every 5 seconds"
-  # and responds to violations with HTTP 429 + plain-text body. The
-  # 2026-04-26 incident root cause was `request_delay_seconds: 1.0`.
-  # Do NOT set request_delay_seconds below 5.0 unless GDELT publishes
-  # a higher rate. 5.5 leaves margin for jitter.
+  # and responds to violations with HTTP 429 + plain-text body. Plus,
+  # once an IP has been rate-limited, GDELT tarpits SSL handshakes
+  # for several minutes — observed as a wave of ConnectTimeouts.
+  # `request_delay_seconds` is now the GLOBAL rate-limiter interval
+  # (was per-category in v2). Defaults to 6.0; the limiter widens to
+  # 12s for 60s after any 429.
   #
-  # 13 categories × 5.5s = ~72s minimum cycle time. With poll_seconds=300
-  # that gives ~228s of idle time per cycle, plenty for retries.
-  #
-  # Per-category exponential backoff: a category that fails is skipped
-  # for min(60s × 2^N, 30min) before next attempt. So a single bad
-  # query / a 429 storm doesn't replay every cycle.
+  # `categories`:
+  #   - omitted / null → v3 default subset (shooting +
+  #       election_result + macro_data_surprise) for stability
+  #   - "all" → every registered category (13 today)
+  #   - list of names → custom subset
+  # Promote to "all" only after the cycle log shows consistent ok>0.
   gdelt:
     enabled: true
     poll_seconds: 300
     max_records_per_query: 50
-    request_delay_seconds: 5.5
-    # Split httpx timeout — single 15s deadlines were getting eaten
-    # in SSL handshake on rate-limited IPs.
-    timeout_connect_seconds: 10.0
-    timeout_read_seconds: 20.0
+    request_delay_seconds: 6.0
+    # Bumped from 10/20: SSL handshakes on rate-limited IPs were
+    # eating the connect budget. 20s connect / 30s read gives the
+    # tarpitted-IP case enough room without compounding.
+    timeout_connect_seconds: 20.0
+    timeout_read_seconds: 30.0
+    # Retry-once on transient timeout. The first ConnectTimeout /
+    # ReadTimeout per attempt gets one retry after a 5s wait
+    # (still through the rate limiter). A second timeout records
+    # as failure.
+    retry_on_timeout: true
     timespan: 15min
+    # Phase 1 — keep the active set small until proven stable.
+    categories:
+      - shooting
+      - election_result
+      - macro_data_surprise
 markets:
   refresh_seconds: 300
   gamma_url: https://gamma-api.polymarket.com/markets

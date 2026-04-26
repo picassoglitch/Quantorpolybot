@@ -19,6 +19,9 @@ import pytest
 from core.feeds.gdelt import (
     _BACKOFF_BASE_SECONDS,
     _BACKOFF_CAP_SECONDS,
+    _PENALTY_HOLD_SECONDS,
+    _PENALTY_WIDEN_TO_SECONDS,
+    GdeltRateLimiter,
     _CategoryState,
     _classify_failure,
     _fetch_gdelt,
@@ -80,7 +83,7 @@ async def test_fetch_ok_returns_articles(monkeypatch):
          "language": "english", "seendate": "20260426010000"},
     ]}).encode()
     _patch_client(monkeypatch, response=_MockResponse(status_code=200, body=body))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is True
     assert r.status_code == 200
     assert len(r.articles) == 2
@@ -93,7 +96,7 @@ async def test_fetch_429_with_text_body_classified_as_rate_limit(monkeypatch):
     _patch_client(monkeypatch, response=_MockResponse(
         status_code=429, body=body, content_type="text/plain",
     ))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is False
     assert r.failure_mode == "rate_limit"
     assert r.status_code == 429
@@ -115,7 +118,7 @@ async def test_fetch_200_with_rate_limit_text_body_also_classified_as_rate_limit
     _patch_client(monkeypatch, response=_MockResponse(
         status_code=200, body=body, content_type="text/plain",
     ))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is False
     assert r.failure_mode == "rate_limit"
 
@@ -126,7 +129,7 @@ async def test_fetch_200_html_body_classified_as_non_json(monkeypatch):
     _patch_client(monkeypatch, response=_MockResponse(
         status_code=200, body=body, content_type="text/html",
     ))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is False
     assert r.failure_mode == "non_json"
     assert "html" in r.content_type
@@ -140,7 +143,7 @@ async def test_fetch_200_invalid_json_with_json_content_type(monkeypatch):
     _patch_client(monkeypatch, response=_MockResponse(
         status_code=200, body=body, content_type="application/json",
     ))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is False
     assert r.failure_mode == "json_decode"
     assert r.exception_class in ("JSONDecodeError", "ValueError")
@@ -153,7 +156,7 @@ async def test_fetch_200_empty_body_returns_ok_with_zero_articles(monkeypatch):
     _patch_client(monkeypatch, response=_MockResponse(
         status_code=200, body=b"", content_type="application/json",
     ))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is True
     assert r.articles == []
 
@@ -163,7 +166,7 @@ async def test_fetch_5xx_classified_as_server_error(monkeypatch):
     _patch_client(monkeypatch, response=_MockResponse(
         status_code=503, body=b"upstream broken", content_type="text/plain",
     ))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is False
     assert r.failure_mode == "server_error"
     assert r.status_code == 503
@@ -174,7 +177,7 @@ async def test_fetch_403_classified_as_http_error(monkeypatch):
     _patch_client(monkeypatch, response=_MockResponse(
         status_code=403, body=b"forbidden",
     ))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is False
     assert r.failure_mode == "http_error"
 
@@ -182,7 +185,7 @@ async def test_fetch_403_classified_as_http_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_fetch_connect_timeout_classified_as_timeout(monkeypatch):
     _patch_client(monkeypatch, raise_exc=httpx.ConnectTimeout("timed out"))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is False
     assert r.failure_mode == "timeout"
     assert r.exception_class == "ConnectTimeout"
@@ -191,7 +194,7 @@ async def test_fetch_connect_timeout_classified_as_timeout(monkeypatch):
 @pytest.mark.asyncio
 async def test_fetch_read_timeout_classified_as_timeout(monkeypatch):
     _patch_client(monkeypatch, raise_exc=httpx.ReadTimeout("read timed out"))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is False
     assert r.failure_mode == "timeout"
 
@@ -199,7 +202,7 @@ async def test_fetch_read_timeout_classified_as_timeout(monkeypatch):
 @pytest.mark.asyncio
 async def test_fetch_network_error_classified_as_network(monkeypatch):
     _patch_client(monkeypatch, raise_exc=httpx.ConnectError("dns failed"))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     assert r.ok is False
     assert r.failure_mode == "network"
 
@@ -210,7 +213,7 @@ async def test_fetch_diagnostic_truncates_body_at_300_chars(monkeypatch):
     _patch_client(monkeypatch, response=_MockResponse(
         status_code=429, body=body, content_type="text/plain",
     ))
-    r = await _fetch_gdelt("test")
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
     # Excerpt cap is 300 — never log a full multi-KB body.
     assert len(r.body_excerpt) <= 300
 
@@ -222,7 +225,7 @@ async def test_fetch_never_raises_even_on_unexpected_exception(monkeypatch):
     class _Boom(Exception):
         pass
     _patch_client(monkeypatch, raise_exc=_Boom("something weird"))
-    r = await _fetch_gdelt("test")  # MUST NOT RAISE
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)  # MUST NOT RAISE
     assert r.ok is False
     assert r.exception_class == "_Boom"
     assert "something weird" in r.exception_msg
@@ -333,3 +336,243 @@ def test_success_resets_state():
     assert s.next_retry_ts == 0.0
     assert s.is_ready(now=0.0) is True
     assert s.last_failure_mode == ""
+
+
+# ============================================================
+# GdeltRateLimiter — global serialization + 429 widening
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_limiter_first_acquire_does_not_wait():
+    lim = GdeltRateLimiter(min_interval_seconds=6.0)
+    wait = await lim.acquire()
+    assert wait == 0.0
+
+
+@pytest.mark.asyncio
+async def test_limiter_second_acquire_sleeps_until_interval_elapsed(monkeypatch):
+    """Don't actually sleep 6s in tests — patch asyncio.sleep + the
+    clock so we can prove the wait is computed correctly."""
+    from core.feeds import gdelt as gdelt_mod
+    fake_now = [1000.0]
+    sleeps: list[float] = []
+
+    def _now():
+        return fake_now[0]
+
+    async def _sleep(s):
+        sleeps.append(s)
+        # Advance fake clock so the next acquire sees time has passed.
+        fake_now[0] += s
+
+    monkeypatch.setattr(gdelt_mod, "now_ts", _now)
+    monkeypatch.setattr("asyncio.sleep", _sleep)
+
+    lim = GdeltRateLimiter(min_interval_seconds=6.0)
+    await lim.acquire()  # t=1000, no wait
+    assert sleeps == []
+    # No real time has passed in fake-clock land, so second acquire
+    # must wait the full 6.0s.
+    await lim.acquire()
+    assert len(sleeps) == 1
+    assert abs(sleeps[0] - 6.0) < 0.01
+
+
+@pytest.mark.asyncio
+async def test_limiter_widens_after_penalize(monkeypatch):
+    from core.feeds import gdelt as gdelt_mod
+    fake_now = [1000.0]
+    monkeypatch.setattr(gdelt_mod, "now_ts", lambda: fake_now[0])
+
+    lim = GdeltRateLimiter(min_interval_seconds=6.0)
+    assert lim.current_interval_seconds == 6.0
+    lim.penalize(widen_to_seconds=12.0, hold_for_seconds=60.0)
+    assert lim.current_interval_seconds == 12.0
+    # Inside hold window: still wide.
+    fake_now[0] += 30.0
+    assert lim.current_interval_seconds == 12.0
+    # After hold window: narrows back to base.
+    fake_now[0] += 60.0
+    assert lim.current_interval_seconds == 6.0
+
+
+@pytest.mark.asyncio
+async def test_limiter_penalize_does_not_narrow_existing_wide_window(monkeypatch):
+    """If a 429 hits during an existing penalty, the limiter takes
+    the WIDER interval and the LATER expiry — never narrows
+    accidentally."""
+    from core.feeds import gdelt as gdelt_mod
+    fake_now = [1000.0]
+    monkeypatch.setattr(gdelt_mod, "now_ts", lambda: fake_now[0])
+
+    lim = GdeltRateLimiter(min_interval_seconds=6.0)
+    lim.penalize(widen_to_seconds=20.0, hold_for_seconds=120.0)
+    assert lim.current_interval_seconds == 20.0
+    # A second penalty with smaller widen / shorter hold must NOT
+    # narrow us down or shorten the cool-off.
+    lim.penalize(widen_to_seconds=8.0, hold_for_seconds=30.0)
+    assert lim.current_interval_seconds == 20.0
+    fake_now[0] += 60.0
+    # Still inside the original 120s window.
+    assert lim.current_interval_seconds == 20.0
+
+
+# ============================================================
+# Fetch ↔ Limiter integration: 429 widens limiter automatically
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_fetch_429_widens_the_limiter(monkeypatch):
+    """Spec: on 429 the GLOBAL_LIMITER must auto-widen so the next
+    caller spaces further apart without each caller having to know."""
+    body = b"Please limit requests to one every 5 seconds..."
+    _patch_client(monkeypatch, response=_MockResponse(
+        status_code=429, body=body, content_type="text/plain",
+    ))
+    lim = GdeltRateLimiter(min_interval_seconds=6.0)
+    assert lim.current_interval_seconds == 6.0
+    r = await _fetch_gdelt("test", limiter=lim, retry_on_timeout=False)
+    assert r.failure_mode == "rate_limit"
+    assert lim.current_interval_seconds == _PENALTY_WIDEN_TO_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_fetch_non_429_failure_does_not_penalize_limiter(monkeypatch):
+    """Server errors / network errors must NOT widen the limiter —
+    those failures aren't caused by request rate."""
+    _patch_client(monkeypatch, response=_MockResponse(
+        status_code=503, body=b"down",
+    ))
+    lim = GdeltRateLimiter(min_interval_seconds=6.0)
+    r = await _fetch_gdelt("test", limiter=lim, retry_on_timeout=False)
+    assert r.failure_mode == "server_error"
+    assert lim.current_interval_seconds == 6.0
+
+
+# ============================================================
+# Retry-once on timeout
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_retry_on_timeout_succeeds_on_second_attempt(monkeypatch):
+    """First attempt times out, second returns 200 + valid JSON.
+    Caller gets the success, not the timeout."""
+    body = json.dumps({"articles": [
+        {"url": "https://x.com/1", "title": "t", "domain": "x.com"},
+    ]}).encode()
+    ok_response = _MockResponse(status_code=200, body=body)
+
+    call_count = [0]
+
+    class _Flaky:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def get(self, *a, **k):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise httpx.ConnectTimeout("first attempt timed out")
+            return ok_response
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _Flaky())
+    # Patch asyncio.sleep so the 5s retry delay doesn't slow tests.
+    async def _no_sleep(_):
+        return
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=True)
+    assert r.ok is True
+    assert call_count[0] == 2
+    assert len(r.articles) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_on_timeout_records_failure_after_two_attempts(monkeypatch):
+    """Both attempts time out → caller sees a clean 'timeout (2 attempts)'
+    failure, not an unraised exception."""
+    _patch_client(monkeypatch, raise_exc=httpx.ConnectTimeout("persistent"))
+    async def _no_sleep(_):
+        return
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=True)
+    assert r.ok is False
+    assert r.failure_mode == "timeout"
+    assert "2 attempts" in r.exception_msg
+
+
+@pytest.mark.asyncio
+async def test_retry_on_timeout_disabled_means_one_attempt(monkeypatch):
+    """With retry_on_timeout=False, a timeout records failure
+    immediately — no second attempt."""
+    call_count = [0]
+
+    class _Counting:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def get(self, *a, **k):
+            call_count[0] += 1
+            raise httpx.ConnectTimeout("once")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _Counting())
+
+    r = await _fetch_gdelt("test", limiter=None, retry_on_timeout=False)
+    assert r.ok is False
+    assert r.failure_mode == "timeout"
+    assert call_count[0] == 1
+    assert "no retry" in r.exception_msg
+
+
+# ============================================================
+# Categories whitelist resolution
+# ============================================================
+
+
+def test_resolve_enabled_categories_default_subset():
+    from core.feeds.gdelt import GdeltFeed, _DEFAULT_ENABLED_CATEGORIES
+    f = GdeltFeed()
+    assert f._resolve_enabled_categories(None) == list(_DEFAULT_ENABLED_CATEGORIES)
+
+
+def test_resolve_enabled_categories_all():
+    from core.feeds.gdelt import _CATEGORY_QUERIES, GdeltFeed
+    f = GdeltFeed()
+    out = f._resolve_enabled_categories("all")
+    assert set(out) == set(_CATEGORY_QUERIES.keys())
+
+
+def test_resolve_enabled_categories_explicit_list():
+    from core.feeds.gdelt import GdeltFeed
+    from core.scout.event import EventCategory
+    f = GdeltFeed()
+    out = f._resolve_enabled_categories(["shooting", "ceasefire"])
+    assert out == [EventCategory.SHOOTING, EventCategory.CEASEFIRE]
+
+
+def test_resolve_enabled_categories_drops_unknown_names():
+    from core.feeds.gdelt import GdeltFeed
+    from core.scout.event import EventCategory
+    f = GdeltFeed()
+    out = f._resolve_enabled_categories(["shooting", "fake_category"])
+    assert out == [EventCategory.SHOOTING]
+
+
+def test_resolve_enabled_categories_falls_back_when_all_invalid():
+    from core.feeds.gdelt import GdeltFeed, _DEFAULT_ENABLED_CATEGORIES
+    f = GdeltFeed()
+    out = f._resolve_enabled_categories(["fake_a", "fake_b"])
+    assert out == list(_DEFAULT_ENABLED_CATEGORIES)
+
+
+def test_resolve_enabled_categories_dedupes():
+    from core.feeds.gdelt import GdeltFeed
+    from core.scout.event import EventCategory
+    f = GdeltFeed()
+    out = f._resolve_enabled_categories(["shooting", "shooting", "ceasefire"])
+    assert out == [EventCategory.SHOOTING, EventCategory.CEASEFIRE]

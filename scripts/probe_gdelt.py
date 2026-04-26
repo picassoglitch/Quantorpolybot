@@ -43,6 +43,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.feeds.gdelt import (  # noqa: E402
+    GLOBAL_LIMITER,
     _CANARY_QUERY,
     _CATEGORY_QUERIES,
     _fetch_gdelt,
@@ -119,15 +120,19 @@ async def main() -> int:
         return 0 if result.ok else 1
 
     if args.all:
-        had_failure = False
-        for i, (cat, q) in enumerate(_CATEGORY_QUERIES.items()):
-            if i > 0:
-                # Match connector's request pacing.
-                await asyncio.sleep(5.5)
+        # No manual sleep — the GLOBAL_LIMITER inside _fetch_gdelt
+        # spaces calls. Sharing the limiter between this script and
+        # any concurrent bot run prevents the probe from burning the
+        # bot's rate budget.
+        for cat, q in _CATEGORY_QUERIES.items():
             await _probe_one(
                 cat, q, max_records=args.max_records, timespan=args.timespan,
                 verbose=args.verbose, normalize_too=normalize_too,
             )
+        print(
+            f"\nlimiter: base={GLOBAL_LIMITER.base_interval_seconds:.1f}s "
+            f"current={GLOBAL_LIMITER.current_interval_seconds:.1f}s"
+        )
         return 0
 
     if args.category:

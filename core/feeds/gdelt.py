@@ -2,15 +2,11 @@
 
 GDELT's public API: https://api.gdeltproject.org/api/v2/doc/doc
 No auth, no rate limit token (soft rate limit only). Returns articles
-matching a query within a time window, with structured fields:
-
-  - ``url``, ``title``, ``seendate``, ``socialimage``, ``domain``,
-    ``language``, ``sourcecountry``
+matching a query within a time window.
 
 We poll on a configurable cadence and write each new article into
-``scout_signals`` with ``source="gdelt"`` and ``raw_payload`` carrying
-the full JSON record. Dedup is by ``signal_hash`` (sha256 of
-source + url).
+``scout_signals`` with ``source="gdelt"``. Dedup is by ``signal_hash``
+(sha256 of source + url).
 
 Deliberately writes to ``scout_signals``, not ``feed_items``: the
 existing signals pipeline auto-scores every feed_items row via Ollama,
@@ -18,29 +14,43 @@ which would double-process GDELT (the scout has its own heuristic
 impact scorer in PR #1; LLM-backed scoring of these articles is on
 the roadmap, not in v1).
 
-Resilience contract (post-incident, 2026-04-26):
+Resilience contract (post-incidents, 2026-04-26):
 
   GDELT enforces a hard "1 request every 5 seconds" rate limit and
-  responds to violations with HTTP 429 + a plain-text body
-  ("Please limit requests to one every 5 seconds..."). Earlier
-  versions of this connector had `request_delay_seconds: 1.0` which
-  hit that limit on every cycle, then crashed `r.json()` on the
-  text body, then surfaced as a vague `"category=X failed: ..."`
-  log. The fix is the union of:
+  responds to violations with HTTP 429 + a plain-text body. Once an
+  IP has been rate-limited, GDELT also tarpits SSL handshakes for
+  several minutes — observed as a wave of ConnectTimeouts even after
+  spacing requests >5s. Recovery requires a fully serial, globally-
+  rate-limited request stream, not just per-category spacing.
 
-    1. ``_fetch_gdelt`` always returns a ``GdeltFetchResult`` — never
-       raises. The result records status / content-type / body excerpt
-       / exception class so triage logs are actionable.
-    2. Default ``request_delay_seconds`` is 5.5 (above the 5s ask).
-    3. Per-category exponential backoff: a category that fails is
-       skipped for `min(60s × 2^N, 30min)` before the next attempt,
-       so one bad query never re-triggers the same 429 storm next
-       cycle.
-    4. Split httpx timeout (connect=10, read=20). Single 15s deadlines
-       were getting eaten in SSL handshake on rate-limited IPs.
-    5. Startup canary: one simple-keyword fetch so the operator sees
-       loud structured logs IF the credential/network/path is broken
-       before the lane runs the full 13-category sweep.
+  v3 (this revision):
+
+    1. ``_fetch_gdelt`` always returns a ``GdeltFetchResult`` —
+       never raises. Records status / content-type / body excerpt /
+       exception class so triage logs are actionable.
+    2. PROCESS-WIDE ``GdeltRateLimiter`` (singleton). Every request
+       — startup canary, category fetches, smoke probe — calls
+       ``await GLOBAL_LIMITER.acquire()`` first. min_interval
+       defaults to 6.0s (above GDELT's 5s ask). On a 429 the
+       limiter widens to 12s for 60s, then narrows back. This is
+       the primary fix for the 429 storms: even with two coroutines
+       calling concurrently the limiter serializes them.
+    3. Per-category exponential backoff (kept from v2): a category
+       that fails is skipped for ``min(60s × 2^N, 30min)``.
+    4. Categories whitelist (``feeds.gdelt.categories`` config) —
+       defaults to a small set (shooting / election_result /
+       macro_data_surprise) until the connector demonstrates
+       stability. Operator can promote to "all" once the cycle log
+       shows consistent ok>0.
+    5. Bumped split httpx timeout (connect=20, read=30). On
+       rate-limited IPs the SSL handshake alone can eat 10s+.
+    6. Retry-once on timeout: the first ConnectTimeout / ReadTimeout
+       gets one retry after a 5s wait (still going through the
+       rate limiter). A persistent timeout backs off the category;
+       a transient one is forgiven.
+    7. INFO-level success log per category fetch — operators need
+       to SEE that the connector is doing work, not only when it
+       fails.
 """
 
 from __future__ import annotations
@@ -97,6 +107,110 @@ _CATEGORY_QUERIES: dict[EventCategory, str] = {
 # point is to verify GDELT is reachable and returning JSON before we
 # launch into the 13-category sweep.
 _CANARY_QUERY = '"climate change"'
+
+# Default categories whitelist for the initial-stability phase. The
+# connector ships covering 13 categories but only RUNS the ones in
+# this list until the operator promotes the config. With one request
+# every ~6s and 3 categories, a cycle is ~18s — well under any
+# reasonable rate limit and easy to validate.
+_DEFAULT_ENABLED_CATEGORIES: tuple[EventCategory, ...] = (
+    EventCategory.SHOOTING,
+    EventCategory.ELECTION_RESULT,
+    EventCategory.MACRO_DATA_SURPRISE,
+)
+
+
+# ============================================================
+# Process-wide rate limiter (singleton)
+# ============================================================
+
+
+class GdeltRateLimiter:
+    """Process-wide async rate limiter for GDELT requests.
+
+    Every code path that hits GDELT (lane cycle, startup canary,
+    smoke probe) MUST call ``await acquire()`` before the HTTP
+    request — that's the contract. Only one request can pass per
+    ``min_interval_seconds``.
+
+    On a 429 response, the caller invokes ``penalize(seconds)`` to
+    widen ``min_interval_seconds`` for that duration, then it
+    automatically narrows back. This is the second-order rate-limit
+    response: not just spacing requests further apart for the
+    immediate retry, but pushing the overall rate down for a window
+    so the IP can cool off.
+
+    Process-local — runs in whichever event loop calls it first. The
+    smoke probe and the lane both reuse the same module-level
+    ``GLOBAL_LIMITER``.
+    """
+
+    def __init__(self, *, min_interval_seconds: float = 6.0) -> None:
+        self._base_interval = float(min_interval_seconds)
+        self._current_interval = float(min_interval_seconds)
+        self._penalty_until_ts: float = 0.0
+        self._last_request_ts: float = 0.0
+        self._lock = asyncio.Lock()
+
+    @property
+    def base_interval_seconds(self) -> float:
+        return self._base_interval
+
+    @property
+    def current_interval_seconds(self) -> float:
+        # If penalty window has expired, narrow back to the base
+        # interval transparently.
+        if self._penalty_until_ts and now_ts() >= self._penalty_until_ts:
+            self._current_interval = self._base_interval
+            self._penalty_until_ts = 0.0
+        return self._current_interval
+
+    def configure(self, *, min_interval_seconds: float) -> None:
+        """Update the base interval. Used by the connector when the
+        operator changes config without restart."""
+        self._base_interval = float(min_interval_seconds)
+        if not self._penalty_until_ts:
+            self._current_interval = self._base_interval
+
+    def penalize(self, *, widen_to_seconds: float, hold_for_seconds: float) -> None:
+        """Widen the interval to ``widen_to_seconds`` for the next
+        ``hold_for_seconds`` (relative to now). Multiple concurrent
+        penalties take the widest interval and the latest expiry —
+        a 429 storm naturally hardens the limiter.
+        """
+        new_interval = max(self._current_interval, float(widen_to_seconds))
+        new_until = max(self._penalty_until_ts, now_ts() + float(hold_for_seconds))
+        self._current_interval = new_interval
+        self._penalty_until_ts = new_until
+
+    async def acquire(self) -> float:
+        """Block until at least ``current_interval_seconds`` has
+        passed since the last request returned. Returns the actual
+        wait time (for log/test inspection)."""
+        async with self._lock:
+            interval = self.current_interval_seconds
+            wait = max(0.0, (self._last_request_ts + interval) - now_ts())
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_ts = now_ts()
+            return wait
+
+
+# Module-level singleton. The probe script and the lane share this
+# instance — that's the whole point of "GLOBAL". Initialised with the
+# v3 default; the connector calls .configure() at run() if config has
+# a different value.
+GLOBAL_LIMITER = GdeltRateLimiter(min_interval_seconds=6.0)
+
+# 429 response: widen the limiter to 12s for 60s. These are
+# conservative — we'd rather over-cool than re-trigger.
+_PENALTY_WIDEN_TO_SECONDS = 12.0
+_PENALTY_HOLD_SECONDS = 60.0
+
+# Retry-once on transient timeout: how long to wait between the
+# timeout and the retry. Goes through the rate limiter on the second
+# attempt as well.
+_TIMEOUT_RETRY_DELAY_SECONDS = 5.0
 
 # GDELT 429 body always begins with this phrase. Detected explicitly so
 # we can short-circuit the "looks like JSON" check and emit a clearly
@@ -219,49 +333,127 @@ async def _fetch_gdelt(
     *,
     max_records: int = 50,
     timespan: str = "15min",
-    timeout_connect: float = 10.0,
-    timeout_read: float = 20.0,
+    timeout_connect: float = 20.0,
+    timeout_read: float = 30.0,
     user_agent: str = "Quantorpolybot/0.1 (scout)",
+    limiter: GdeltRateLimiter | None = GLOBAL_LIMITER,
+    retry_on_timeout: bool = True,
 ) -> GdeltFetchResult:
     """No-throw fetch. Returns a fully-populated GdeltFetchResult on
     every code path so the caller can log a single structured line
     and update its backoff state without try/except gymnastics.
 
+    All requests go through ``limiter`` (default: the process-wide
+    ``GLOBAL_LIMITER``) — every call site of this function MUST
+    share the limiter so we can't accidentally exceed GDELT's
+    1-req/5s rate from concurrent code paths. Pass ``limiter=None``
+    only in tests where rate-limiting isn't being verified.
+
+    On a 429, the limiter is automatically widened (penalize) for
+    a hold window so subsequent calls space themselves further apart
+    without each caller having to know.
+
+    On a transient timeout (Connect or Read) AND ``retry_on_timeout``
+    is True, ONE retry is attempted after a short wait. A second
+    timeout records the failure.
+
     Pulled out of the connector class so:
       - tests can hit it without an event loop fixture for the lane,
-      - the smoke probe script can call it directly.
+      - the smoke probe script can call it directly through the same
+        rate limiter.
     """
     url = _build_url(query, max_records=max_records, timespan=timespan)
     timeout = httpx.Timeout(connect=timeout_connect, read=timeout_read,
                             write=10.0, pool=10.0)
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(url, headers={"User-Agent": user_agent})
-    except httpx.TimeoutException as e:
-        return GdeltFetchResult(
+
+    async def _attempt() -> tuple[GdeltFetchResult, bool]:
+        """Single fetch attempt. Returns ``(result, is_timeout)``.
+
+        ``is_timeout=True`` signals the result was caused by a
+        ``httpx.TimeoutException`` and the caller may retry. The
+        result is still a fully populated ``GdeltFetchResult`` (with
+        the original exception_class preserved) so a no-retry caller
+        gets clean diagnostics.
+        """
+        if limiter is not None:
+            await limiter.acquire()
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get(url, headers={"User-Agent": user_agent})
+        except httpx.TimeoutException as e:
+            return GdeltFetchResult(
+                ok=False, url=url,
+                exception_class=type(e).__name__, exception_msg=str(e)[:300],
+                failure_mode="timeout",
+            ), True
+        except httpx.HTTPError as e:
+            return GdeltFetchResult(
+                ok=False, url=url,
+                exception_class=type(e).__name__, exception_msg=str(e)[:300],
+                failure_mode=_classify_failure(
+                    status_code=0, content_type="", body_excerpt="",
+                    exception_class=type(e).__name__,
+                ),
+            ), False
+        except Exception as e:
+            return GdeltFetchResult(
+                ok=False, url=url,
+                exception_class=type(e).__name__, exception_msg=str(e)[:300],
+                failure_mode=f"exception:{type(e).__name__}",
+            ), False
+        # Successful HTTP — process inline (parse) and return a final
+        # result. Not retry-eligible regardless of failure_mode.
+        return _process_response(r, url), False
+
+    # Attempt 1.
+    result, was_timeout = await _attempt()
+    if was_timeout and retry_on_timeout:
+        # Transient timeout. One retry after a short wait.
+        await asyncio.sleep(_TIMEOUT_RETRY_DELAY_SECONDS)
+        retry_result, retry_was_timeout = await _attempt()
+        if not retry_was_timeout:
+            # Retry produced a definitive answer (success OR non-
+            # timeout failure). Use it.
+            result = retry_result
+        else:
+            # Both attempts timed out — annotate the original result
+            # so logs make clear it wasn't a single transient blip.
+            original_class = result.exception_class
+            result = GdeltFetchResult(
+                ok=False, url=url,
+                exception_class=original_class,
+                exception_msg=(
+                    f"timeout (2 attempts, "
+                    f"connect={timeout_connect}s read={timeout_read}s)"
+                ),
+                failure_mode="timeout",
+            )
+    elif was_timeout:
+        # No-retry policy. Annotate but preserve the original
+        # exception_class so the operator sees what kind of timeout.
+        result = GdeltFetchResult(
             ok=False, url=url,
-            exception_class=type(e).__name__, exception_msg=str(e)[:300],
-            failure_mode=_classify_failure(
-                status_code=0, content_type="", body_excerpt="",
-                exception_class=type(e).__name__,
+            exception_class=result.exception_class,
+            exception_msg=(
+                f"timeout (no retry, "
+                f"connect={timeout_connect}s read={timeout_read}s)"
             ),
-        )
-    except httpx.HTTPError as e:
-        return GdeltFetchResult(
-            ok=False, url=url,
-            exception_class=type(e).__name__, exception_msg=str(e)[:300],
-            failure_mode=_classify_failure(
-                status_code=0, content_type="", body_excerpt="",
-                exception_class=type(e).__name__,
-            ),
-        )
-    except Exception as e:
-        return GdeltFetchResult(
-            ok=False, url=url,
-            exception_class=type(e).__name__, exception_msg=str(e)[:300],
-            failure_mode=f"exception:{type(e).__name__}",
+            failure_mode="timeout",
         )
 
+    # On 429 / 200-with-rate-limit-text-body, widen the global limiter
+    # so the NEXT caller spaces further apart.
+    if not result.ok and result.failure_mode == "rate_limit" and limiter is not None:
+        limiter.penalize(
+            widen_to_seconds=_PENALTY_WIDEN_TO_SECONDS,
+            hold_for_seconds=_PENALTY_HOLD_SECONDS,
+        )
+    return result
+
+
+def _process_response(r: httpx.Response, url: str) -> GdeltFetchResult:
+    """Pull out of ``_fetch_gdelt`` so the retry path doesn't
+    duplicate the parse / classify logic."""
     content_type = r.headers.get("content-type", "")
     body_text = r.text or ""
     body_excerpt = body_text[:300].replace("\n", " ").replace("\r", " ")
@@ -393,53 +585,68 @@ class GdeltFeed:
             return
         poll = int(cfg.get("poll_seconds", 300))
         per_query_max = int(cfg.get("max_records_per_query", 50))
-        # GDELT explicitly asks for 1 request per 5s. 5.5s gives a
-        # safety margin against jitter. The legacy 1.0s default WAS
-        # the root cause of the 2026-04-26 incident — never go back
-        # under 5.0 without GDELT loosening the published rate limit.
-        request_delay = safe_float(cfg.get("request_delay_seconds", 5.5))
-        if request_delay < 5.0:
+        # `request_delay_seconds` is now the GLOBAL rate-limiter
+        # interval (was per-category in v2). Defaults to 6.0 — the
+        # limiter widens to 12s for 60s after any 429 so the IP
+        # cools off before subsequent calls.
+        min_interval = safe_float(cfg.get("request_delay_seconds", 6.0))
+        if min_interval < 5.0:
             logger.warning(
                 "[gdelt] request_delay_seconds={} is below GDELT's "
                 "documented 5s minimum — expect 429s",
-                request_delay,
+                min_interval,
             )
+        GLOBAL_LIMITER.configure(min_interval_seconds=min_interval)
+
         timespan = cfg.get("timespan", "15min")
-        connect_t = safe_float(cfg.get("timeout_connect_seconds", 10.0))
-        read_t = safe_float(cfg.get("timeout_read_seconds", 20.0))
+        # Bumped defaults: 20s connect / 30s read. The previous
+        # 10/20 was getting eaten in SSL handshake on a tarpitted IP.
+        connect_t = safe_float(cfg.get("timeout_connect_seconds", 20.0))
+        read_t = safe_float(cfg.get("timeout_read_seconds", 30.0))
+        retry_on_timeout = bool(cfg.get("retry_on_timeout", True))
+
+        # Categories whitelist. v3 starts with a 3-category subset for
+        # stability (shooting / election_result / macro_data_surprise);
+        # operator can promote to "all" or a custom list once the
+        # cycle log shows consistent ok>0.
+        enabled = self._resolve_enabled_categories(cfg.get("categories"))
         cycle_backoff = Backoff(base=5, cap=300)
 
         logger.info(
-            "[gdelt] starting; poll={}s queries={} per_query_max={} "
-            "timespan={} request_delay={}s timeout=connect{}/read{}",
-            poll, len(_CATEGORY_QUERIES), per_query_max, timespan,
-            request_delay, connect_t, read_t,
+            "[gdelt] starting; poll={}s active_categories={}/{} per_query_max={} "
+            "timespan={} min_interval={}s retry_on_timeout={} "
+            "timeout=connect{}/read{}",
+            poll, len(enabled), len(_CATEGORY_QUERIES), per_query_max,
+            timespan, min_interval, retry_on_timeout, connect_t, read_t,
         )
 
         # ---- One-shot startup canary so an operator sees a clear
-        # diagnostic line BEFORE the 13-category sweep starts. Doesn't
-        # block the loop — failure logs but the main cycle still runs
-        # (categories will hit their own backoffs if GDELT is broken). ----
+        # diagnostic line BEFORE the category sweep starts. Goes
+        # through the same global limiter as everything else. ----
         if not self._canary_done:
-            await self._startup_canary(connect_t, read_t)
+            await self._startup_canary(connect_t, read_t, retry_on_timeout)
             self._canary_done = True
 
         while not self._stop.is_set():
             try:
                 summary = await self._cycle(
+                    enabled_categories=enabled,
                     per_query_max=per_query_max,
                     timespan=timespan,
-                    request_delay=request_delay,
                     timeout_connect=connect_t,
                     timeout_read=read_t,
+                    retry_on_timeout=retry_on_timeout,
                 )
-                if summary["new"] or summary["fail"] or summary["skipped"]:
-                    logger.info(
-                        "[gdelt] cycle ok={} fail={} skipped_in_backoff={} "
-                        "new_signals={}",
-                        summary["ok"], summary["fail"], summary["skipped"],
-                        summary["new"],
-                    )
+                # ALWAYS log the cycle summary at INFO so operators
+                # can see the connector is doing work even when no
+                # signals come in (vs. silent and possibly stuck).
+                logger.info(
+                    "[gdelt] cycle ok={} fail={} skipped_in_backoff={} "
+                    "articles_seen={} new_signals={} limiter_interval={:.1f}s",
+                    summary["ok"], summary["fail"], summary["skipped"],
+                    summary["articles_seen"], summary["new"],
+                    GLOBAL_LIMITER.current_interval_seconds,
+                )
                 cycle_backoff.reset()
             except asyncio.CancelledError:
                 raise
@@ -455,6 +662,56 @@ class GdeltFeed:
                 poll * DEGRADED_POLL_MULTIPLIER if is_degraded() else poll,
             )
 
+    def _resolve_enabled_categories(
+        self, raw: Any,
+    ) -> list[EventCategory]:
+        """Resolve the operator's `categories` config into the actual
+        list of enabled EventCategory enums.
+
+        Accepted values:
+          - None / missing → v3 default subset
+          - "all" → every key in `_CATEGORY_QUERIES`
+          - list of strings → filter by name (unknown names logged + dropped)
+        """
+        if raw is None:
+            return list(_DEFAULT_ENABLED_CATEGORIES)
+        if isinstance(raw, str) and raw.strip().lower() == "all":
+            return list(_CATEGORY_QUERIES.keys())
+        if not isinstance(raw, (list, tuple)):
+            logger.warning(
+                "[gdelt] feeds.gdelt.categories must be 'all' or a list; "
+                "got {!r} — falling back to v3 default subset",
+                raw,
+            )
+            return list(_DEFAULT_ENABLED_CATEGORIES)
+        out: list[EventCategory] = []
+        seen: set[EventCategory] = set()
+        for name in raw:
+            try:
+                cat = EventCategory(str(name).strip().lower())
+            except ValueError:
+                logger.warning(
+                    "[gdelt] unknown category in config: {!r}", name,
+                )
+                continue
+            if cat not in _CATEGORY_QUERIES:
+                logger.warning(
+                    "[gdelt] category {!r} has no GDELT query registered",
+                    cat.value,
+                )
+                continue
+            if cat in seen:
+                continue
+            seen.add(cat)
+            out.append(cat)
+        if not out:
+            logger.warning(
+                "[gdelt] no valid categories after filtering — "
+                "falling back to v3 default subset",
+            )
+            return list(_DEFAULT_ENABLED_CATEGORIES)
+        return out
+
     async def stop(self) -> None:
         self._stop.set()
 
@@ -464,17 +721,25 @@ class GdeltFeed:
         except asyncio.TimeoutError:
             return
 
-    async def _startup_canary(self, connect_t: float, read_t: float) -> None:
+    async def _startup_canary(
+        self, connect_t: float, read_t: float, retry_on_timeout: bool,
+    ) -> None:
         """Single broad-keyword fetch to surface env/network/path
         issues at startup with a single loud log line. Failure does
         NOT abort startup — categories will discover the same
-        breakage via their own backoffs."""
+        breakage via their own backoffs.
+
+        Goes through ``GLOBAL_LIMITER`` like everything else, so the
+        canary counts as the first request of the cycle's rate
+        budget.
+        """
         result = await _fetch_gdelt(
             _CANARY_QUERY,
             max_records=5,
             timespan="1h",
             timeout_connect=connect_t,
             timeout_read=read_t,
+            retry_on_timeout=retry_on_timeout,
         )
         if result.ok:
             logger.info(
@@ -492,19 +757,29 @@ class GdeltFeed:
     async def _cycle(
         self,
         *,
+        enabled_categories: list[EventCategory],
         per_query_max: int,
         timespan: str,
-        request_delay: float,
         timeout_connect: float,
         timeout_read: float,
+        retry_on_timeout: bool,
     ) -> dict[str, int]:
         """One iteration of the per-category sweep. Returns a counter
-        dict — used by the cycle log line and by tests."""
-        ok = fail = skipped = new = 0
+        dict — used by the cycle log line and by tests.
+
+        Strictly serial — each category's request goes through
+        ``GLOBAL_LIMITER.acquire()`` so they never burst, even if a
+        future caller invokes the connector from a different
+        coroutine.
+        """
+        ok = fail = skipped = new = articles_seen = 0
         now_t = now_ts()
-        for category, query in _CATEGORY_QUERIES.items():
+        for category in enabled_categories:
             if self._stop.is_set():
                 break
+            query = _CATEGORY_QUERIES.get(category)
+            if not query:
+                continue
             state = self._cat_state[category]
             if not state.is_ready(now_t):
                 skipped += 1
@@ -516,12 +791,15 @@ class GdeltFeed:
                 continue
 
             state.last_attempt_ts = now_t
+            # Limiter is invoked inside _fetch_gdelt — no need to
+            # sleep manually here, the limiter spaces calls.
             result = await _fetch_gdelt(
                 query,
                 max_records=per_query_max,
                 timespan=timespan,
                 timeout_connect=timeout_connect,
                 timeout_read=timeout_read,
+                retry_on_timeout=retry_on_timeout,
             )
 
             if not result.ok:
@@ -530,13 +808,12 @@ class GdeltFeed:
                     status=result.status_code,
                     now=now_t,
                 )
-                # Single structured line per failure — the log is the
-                # debug interface here. body_excerpt + content_type +
-                # exception class together pinpoint the failure mode.
                 logger.warning(
-                    "[gdelt] category={} {} backoff={:.0f}s consecutive={}",
+                    "[gdelt] category={} {} backoff={:.0f}s consecutive={} "
+                    "limiter_interval={:.1f}s",
                     category.value, result.diagnostic(),
                     next_retry - now_t, state.consecutive_failures,
+                    GLOBAL_LIMITER.current_interval_seconds,
                 )
                 fail += 1
             else:
@@ -545,20 +822,26 @@ class GdeltFeed:
                     result.articles, category,
                 )
                 new += category_new
+                articles_seen += len(result.articles)
                 ok += 1
-                if result.articles:
-                    logger.debug(
-                        "[gdelt] category={} {} new={}",
-                        category.value, result.diagnostic(), category_new,
-                    )
+                # INFO — operators need to SEE successful work, not
+                # only failures. Even an empty-articles response is
+                # signal that the connector + GDELT are talking.
+                logger.info(
+                    "[gdelt] category={} ok status={} articles={} new={} "
+                    "bytes={} ct={}",
+                    category.value, result.status_code,
+                    len(result.articles), category_new,
+                    result.bytes_len, result.content_type,
+                )
 
-            # Pace requests irrespective of success/fail — the rate
-            # limit applies to attempts, not just successes.
-            if request_delay > 0 and not self._stop.is_set():
-                await self._sleep(request_delay)
             now_t = now_ts()  # advance for the next category's
-                              # is_ready() check
-        return {"ok": ok, "fail": fail, "skipped": skipped, "new": new}
+                              # is_ready() check (the limiter sleep
+                              # happened inside _fetch_gdelt)
+        return {
+            "ok": ok, "fail": fail, "skipped": skipped, "new": new,
+            "articles_seen": articles_seen,
+        }
 
     async def _persist_articles(
         self, articles: list[dict[str, Any]], category: EventCategory,
