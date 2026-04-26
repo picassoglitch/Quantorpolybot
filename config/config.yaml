@@ -328,22 +328,68 @@ signals:
   min_keyword_overlap: 0.05
   market_rescore_cooldown_seconds: 180
   max_candidate_days: 365
+  # Per-pipeline-call cap on parallel ``build_market_context`` lookups.
+  # Each lookup opens 3 aiosqlite connections (price/news/peers); with
+  # ~25 candidates the unbounded fan-out fights WAL serialization and
+  # contributes to the watchdog-observed loop stalls. 5 covers >95% of
+  # feed items in practice.
+  context_top_k: 5
 ollama:
   host: http://localhost:11434
   model: qwen2.5:7b-instruct-q4_K_M
   fast_model: qwen2.5:7b-instruct-q4_K_M
   deep_model: qwen2.5:7b-instruct-q4_K_M
   validator_model: llama3:8b-instruct-q8_0
-  fast_timeout_seconds: 45
-  deep_timeout_seconds: 60
-  validator_timeout_seconds: 60
+  # Hard wall-clock budgets enforced by ``asyncio.wait_for`` on the
+  # loop side. These are intentionally tight: every Ollama call now
+  # runs on a per-tier ThreadPoolExecutor (see core.signals.ollama_executor),
+  # so the worker thread is bounded by these timeouts and the loop
+  # never blocks on the network. April 2026 soak: 45/60/60 was too
+  # generous and let stalled deep calls eat 60+ seconds while the
+  # watchdog accumulated `event_loop_blocked` warnings. 10/20/20 is
+  # tighter than the GPU's natural latency for a healthy call but lets
+  # the heuristic fallback take over fast on a degraded server.
+  fast_timeout_seconds: 10
+  deep_timeout_seconds: 20
+  validator_timeout_seconds: 20
   fast_temperature: 0.2
   deep_temperature: 0.3
   validator_temperature: 0.1
+  # Master kill-switch for the deep tier in the realtime path. The
+  # April 2026 soak machine is currently CPU-only — `ollama serve`
+  # logs `inference compute id=cpu` — so qwen2.5:7b takes 20-45s
+  # per call, which the realtime signal pipeline can't tolerate.
+  # When this is false:
+  #   - Signal pipeline routes through core.strategies.heuristic
+  #     (keyword scorer) instead of generate_json.
+  #   - core.strategies.scoring.score / score_with_fallback gate
+  #     tier=="deep" calls (return None / heuristic respectively).
+  #   - Deep tier remains available for background jobs (prompt
+  #     evolution, news enrichment) where multi-second latency is OK.
+  # Flip back to true once Ollama is running on GPU and a deep call
+  # consistently completes under the 20s budget.
+  deep_realtime_enabled: false
   queue_depth_alert: 5
+  # Per-tier in-flight caps. Each tier has its own asyncio.Semaphore so
+  # a stuck deep call doesn't starve fast scoring. Legacy
+  # ``max_concurrent_calls`` (kept below) is honored as the fast-tier
+  # default when ``fast_max_concurrent`` is missing — that's the only
+  # backwards-compat path; deep/validator always use the new keys.
+  fast_max_concurrent: 2
+  deep_max_concurrent: 1
+  validator_max_concurrent: 1
   max_concurrent_calls: 2
   validator_high_stakes_usd: 10
   validator_max_prob_drift: 0.15
+  # Process-wide circuit breaker. After ``circuit_open_threshold``
+  # consecutive failures on a tier, that tier is short-circuited for
+  # ``circuit_open_seconds``. One half-open probe is admitted after
+  # the window; success closes the circuit, failure re-opens it for
+  # 2× the cooldown. Logs print "circuit OPENED|HALF-OPEN|CLOSED" on
+  # each state transition so operator triage sees the breaker
+  # explicitly.
+  circuit_open_threshold: 5
+  circuit_open_seconds: 60
 scheduler:
   market_refresh_cron: '*/5 * * * *'
   health_check_cron: '*/1 * * * *'

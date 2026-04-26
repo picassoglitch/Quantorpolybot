@@ -146,6 +146,8 @@ class ScalpingLane:
         total = len(candidates)
         skipped: dict[str, int] = {}
         scored_n = 0
+        ollama_n = 0      # of scored, came from a real Ollama response
+        heuristic_n = 0   # of scored, came from the keyword fallback
         low_conf = 0
         low_edge = 0
         entered = 0
@@ -176,18 +178,31 @@ class ScalpingLane:
             if vol < min_volume:
                 skipped["volume"] = skipped.get("volume", 0) + 1
                 continue
-            # Score via Ollama.
+            # Score via Ollama (or keyword heuristic on saturation /
+            # timeout — see core.strategies.scoring.score_with_fallback).
+            # Lanes used to call ``scoring.score`` here, which returned
+            # ``None`` whenever the fast queue was saturated or Ollama
+            # stalled; that produced "scan total=40 ... scored=0" for
+            # entire 10-minute windows. ``score_with_fallback`` always
+            # returns a Score so a degraded GPU never zeros out entries.
             text = "\n".join(
                 f"{e.get('title','')}: {(e.get('summary') or '')[:200]}"
                 for e in evidence[:3]
             )
             # Scalping entry uses the fast tier: ~40 candidates per cycle
             # means we can't afford the 15-30s deep model here.
-            score = await scoring.score(market, text, self._client, tier="fast")
-            if score is None:
-                skipped["score_none"] = skipped.get("score_none", 0) + 1
-                continue
+            score = await scoring.score_with_fallback(
+                market, text, client=self._client, tier="fast",
+            )
             scored_n += 1
+            if score.source == "ollama":
+                ollama_n += 1
+            else:
+                heuristic_n += 1
+            # Heuristic confidence is capped at 0.70 by design (see
+            # core.strategies.heuristic) — the existing min_conf gate
+            # already filters thin keyword signals, so fallback Scores
+            # only enter on a clear directional headline.
             if score.confidence < min_conf:
                 low_conf += 1
                 continue
@@ -247,8 +262,9 @@ class ScalpingLane:
             ) or "none"
             logger.info(
                 "[scalping] scan total={} skip=[{}] scored={} "
-                "low_conf={} low_edge={} entered={}",
-                total, skip_summary, scored_n, low_conf, low_edge, entered,
+                "(ollama={} heuristic={}) low_conf={} low_edge={} entered={}",
+                total, skip_summary, scored_n, ollama_n, heuristic_n,
+                low_conf, low_edge, entered,
             )
         return entered
 
@@ -331,10 +347,13 @@ class ScalpingLane:
         text = "\n".join(
             f"{e.get('title','')}: {(e.get('summary') or '')[:150]}" for e in evidence
         ) or market.question
-        # Re-scores are the hottest path — always fast tier.
-        score = await scoring.score(market, text, self._client, tier="fast")
-        if score is None:
-            return None
+        # Re-scores are the hottest path — always fast tier. Use the
+        # fallback-aware scorer so a saturated GPU doesn't quietly skip
+        # the conviction update; the heuristic at least gives us a
+        # directional read on a fresh headline.
+        score = await scoring.score_with_fallback(
+            market, text, client=self._client, tier="fast",
+        )
         await shadow.append_conviction(pos, score.true_prob, snap.mid)
         # Flip: edge crosses mid relative to original side.
         new_edge = score.true_prob - snap.mid

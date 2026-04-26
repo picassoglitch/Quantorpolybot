@@ -126,7 +126,9 @@ def test_fast_queue_saturated_uses_config(monkeypatch):
 async def test_fast_score_routes_to_fast_model(monkeypatch):
     seen: list[dict] = []
 
-    async def fake_generate(self, prompt, *, call_type, response_format="json"):
+    async def fake_generate(
+        self, prompt, *, call_type, response_format="json", tag="",
+    ):
         seen.append({
             "call_type": call_type,
             "model": self._model_for(call_type),
@@ -159,7 +161,9 @@ async def test_fast_score_routes_to_fast_model(monkeypatch):
 async def test_generate_json_legacy_routes_to_deep(monkeypatch):
     seen: list[str] = []
 
-    async def fake_generate(self, prompt, *, call_type, response_format="json"):
+    async def fake_generate(
+        self, prompt, *, call_type, response_format="json", tag="",
+    ):
         seen.append(call_type)
         return {"implied_prob": 0.5, "confidence": 0.5, "reasoning": "x"}, {}
 

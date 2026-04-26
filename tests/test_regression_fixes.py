@@ -1,7 +1,12 @@
 """Regression tests for the three post-incident fixes:
 
-1. Ollama httpx singleton — the same client instance must be returned
-   across calls so the connection pool and keep-alive state survive.
+1. Ollama executor singleton — the per-tier ThreadPoolExecutor must be
+   reused across calls so connection state on each worker's sync httpx
+   client survives. (Originally tested an async-httpx singleton; the
+   April 2026 hard-isolation rebuild moved every Ollama HTTP call onto
+   per-tier executors, so the test now verifies the executor-pool
+   identity instead. Same intent: don't recreate transport state on
+   every call.)
 2. Market-universe filter + hard cap — 15k raw markets must be reduced
    to <= MAX_MARKETS, and the cap must be enforced by the
    volume/time-to-resolve composite rank.
@@ -18,39 +23,40 @@ import pytest
 
 from core.feeds.polymarket_ws import PolymarketWS
 from core.markets.discovery import _apply_universe_filter
-from core.signals.ollama_client import (
-    _get_shared_client,
-    reset_shared_client,
-)
+from core.signals import ollama_executor
+from core.signals.ollama_client import reset_shared_client
 
 
-# -- 1. Singleton httpx client ------------------------------------------
+# -- 1. Per-tier executor singleton -------------------------------------
+
+
+def test_ollama_executor_singleton_per_tier():
+    ollama_executor.reset_for_tests()
+    try:
+        a = ollama_executor._get_executor("fast")
+        b = ollama_executor._get_executor("fast")
+        assert a is b, "per-tier executor must be reused across calls"
+        # Tiers MUST NOT share an executor — that's the hard-isolation
+        # invariant. A deep-tier worker thread is on a different pool
+        # from any fast-tier worker.
+        deep = ollama_executor._get_executor("deep")
+        assert a is not deep
+    finally:
+        ollama_executor.reset_for_tests()
 
 
 @pytest.mark.asyncio
-async def test_ollama_singleton_reuses_client():
-    await reset_shared_client()
+async def test_ollama_reset_rebuilds_executor():
+    """``reset_shared_client`` is the watchdog's "drop everything" hook
+    — after it runs, the next call must build a fresh executor."""
+    ollama_executor.reset_for_tests()
     try:
-        a = await _get_shared_client()
-        b = await _get_shared_client()
-        assert a is b, "shared client must be reused across calls"
-        assert not a.is_closed
+        a = ollama_executor._get_executor("fast")
+        await reset_shared_client()
+        b = ollama_executor._get_executor("fast")
+        assert a is not b, "reset must force a new executor instance"
     finally:
-        await reset_shared_client()
-
-
-@pytest.mark.asyncio
-async def test_ollama_reset_rebuilds_client():
-    await reset_shared_client()
-    try:
-        a = await _get_shared_client()
-        await reset_shared_client()
-        b = await _get_shared_client()
-        assert a is not b, "reset must force a new client instance"
-        assert a.is_closed
-        assert not b.is_closed
-    finally:
-        await reset_shared_client()
+        ollama_executor.reset_for_tests()
 
 
 # -- 2. Market universe filter cap --------------------------------------
