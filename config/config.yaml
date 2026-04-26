@@ -54,17 +54,22 @@ shadow_risk:
   check_interval_seconds: 30
 shadow_capital:
   total_usd: 50.0
+  # Step #3 PR #1 added `breaking_event_scout` (5% slice carved out
+  # of scalping). The new lane is SHADOW only — `real_capital` keeps
+  # 0 across the board.
   lane_allocations:
-    scalping: 0.6
+    scalping: 0.55
     event_sniping: 0.3
     longshot: 0.1
+    breaking_event_scout: 0.05
   min_lane_available_usd: 0.5
 real_capital:
   total_usd: 0.0
   lane_allocations:
-    scalping: 0.6
+    scalping: 0.55
     event_sniping: 0.3
     longshot: 0.1
+    breaking_event_scout: 0.05
   min_lane_available_usd: 50.0
 scalping:
   enabled: true
@@ -247,6 +252,53 @@ longshot:
   rescore_seconds: 3600
   entry_scan_seconds: 600
   monitor_seconds: 120
+# Step #3 PR #1: Breaking Event Scout. SHADOW only. Heuristic impact
+# scorer (no LLM in realtime path). 5% slice of shadow_capital
+# carved off scalping (see lane_allocations above). Real budget stays 0.
+breaking_event_scout:
+  enabled: true
+  scan_seconds: 60
+  # Per-scan caps. 200 signals × 13 categories with deduping is well
+  # within memory; the normalizer's bucketing is O(N × C_per_bucket)
+  # so we don't blow up here.
+  max_signals_per_scan: 200
+  max_markets_per_event: 5
+  market_pool_size: 500
+  cluster_window_seconds: 1800   # 30 min window for entity-overlap merge
+  # ---- Mapper-side filters ----
+  mapper_min_score: 0.20
+  min_liquidity: 1000
+  max_spread_cents: 5
+  # ---- Safety gate (core.scout.candidate.evaluate) ----
+  # 2+ corroborating sources OR 1 primary source. The list of primary
+  # sources is curated; anything outside the list relies on the
+  # corroboration path.
+  min_sources: 2
+  primary_sources:
+    - reuters
+    - apnews
+    - bloomberg
+    - bbc
+  require_primary_or_corroboration: true
+  # Edge / confidence floors. Heuristic scorer caps confidence at
+  # 0.55 so 0.40 leaves a band but still gates out near-zero-conviction
+  # impact estimates.
+  min_edge: 0.05
+  min_confidence: 0.40
+  # Event freshness — anything older than this is stale and price has
+  # likely already moved.
+  max_event_age_seconds: 1800
+  # Cool-down: only N accepted candidates per event_id. Prevents the
+  # scout from opening 5 positions across mapped markets when the
+  # impact estimate is repeated.
+  event_max_positions: 1
+  # ---- Position sizing ----
+  # base_position_usd anchors the bottom; max_position_usd is hit at
+  # the heuristic confidence cap (0.55). Both intentionally tiny —
+  # this lane's backtested PnL is unproven; we want to LEARN from
+  # it before sizing up.
+  base_position_usd: 1.0
+  max_position_usd: 3.0
 kelly:
   enabled: true
   fraction: 0.25
@@ -359,6 +411,19 @@ feeds:
     poll_seconds: 600
     auto_signal_divergence: 0.08
     fuzzy_match_threshold: 0.4
+  # Step #3 PR #1: GDELT 2.0 Doc API connector for the Breaking Event
+  # Scout. Public API, no auth required. Polls per-category every
+  # `poll_seconds`, writes to `scout_signals` (NOT `feed_items` — see
+  # core/feeds/gdelt.py for why). 13 categories x ~50 records max =
+  # one cycle is ~13 GETs against api.gdeltproject.org. With
+  # poll_seconds=300 and 1s request_delay between categories, that's
+  # well within GDELT's soft rate limit.
+  gdelt:
+    enabled: true
+    poll_seconds: 300
+    max_records_per_query: 50
+    request_delay_seconds: 1.0
+    timespan: 15min
 markets:
   refresh_seconds: 300
   gamma_url: https://gamma-api.polymarket.com/markets

@@ -36,6 +36,7 @@ from core.risk.rules import RiskEngine
 from core.scheduler.jobs import JobScheduler
 from core.signals.ollama_client import OllamaClient, aclose_shared_client
 from core.signals.pipeline import SignalPipeline
+from core.strategies.breaking_event_scout import BreakingEventScoutLane
 from core.strategies.event_sniper import EventSniperLane
 from core.strategies.longshot import LongshotLane
 from core.strategies.microscalp import MicroscalpLane
@@ -62,6 +63,8 @@ class App:
         self.longshot_lane = LongshotLane()
         self.resolution_day_lane = ResolutionDayLane()
         self.microscalp_lane = MicroscalpLane()
+        # Step #3 PR #1: Breaking Event Scout (SHADOW only).
+        self.scout_lane = BreakingEventScoutLane()
         self.price_refresher = PriceRefresher()
         # Watchdog needs a handle to poly_ws so it can force a reconnect
         # when the CLOB socket goes silent for too long.
@@ -120,6 +123,8 @@ class App:
         self._tasks.append(asyncio.create_task(self.longshot_lane.run(), name="shadow.longshot"))
         self._tasks.append(asyncio.create_task(self.resolution_day_lane.run(), name="shadow.resolution_day"))
         self._tasks.append(asyncio.create_task(self.microscalp_lane.run(), name="shadow.microscalp"))
+        # Step #3 PR #1: Breaking Event Scout (SHADOW only).
+        self._tasks.append(asyncio.create_task(self.scout_lane.run(), name="shadow.breaking_event_scout"))
         self._tasks.append(asyncio.create_task(self.watchdog.run(), name="utils.watchdog"))
 
         self.scheduler.start()

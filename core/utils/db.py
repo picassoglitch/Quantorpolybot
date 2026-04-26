@@ -344,6 +344,92 @@ SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_scan_skips_ts ON scan_skips(scan_ts)",
     "CREATE INDEX IF NOT EXISTS idx_scan_skips_market ON scan_skips(market_id, scan_ts)",
     "CREATE INDEX IF NOT EXISTS idx_scan_skips_lane ON scan_skips(lane, scan_ts)",
+    # ---- Step #3 PR #1: Breaking Event Scout ----
+    # `scout_signals` is the generic landing table for any breaking-news
+    # connector (GDELT today; NewsAPI / SerpAPI / etc. in PR 1.5). One
+    # row per article/event-record produced by a connector. The scout's
+    # normalizer reads from here, so connectors are decoupled from
+    # downstream classification.
+    #
+    # Deliberately NOT `feed_items`: the existing signals pipeline
+    # auto-scores every feed_items row via Ollama, which would
+    # double-process GDELT (the scout already has its own heuristic
+    # impact scorer in this PR — LLM scoring of these articles is on
+    # the roadmap but not in v1).
+    """
+    CREATE TABLE IF NOT EXISTS scout_signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_hash TEXT UNIQUE,
+        source TEXT,
+        source_type TEXT,
+        title TEXT,
+        body TEXT,
+        url TEXT,
+        entities TEXT,
+        category_hint TEXT,
+        published_at REAL,
+        ingested_at REAL,
+        confidence REAL,
+        raw_payload TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_scout_signals_ingested ON scout_signals(ingested_at)",
+    "CREATE INDEX IF NOT EXISTS idx_scout_signals_source ON scout_signals(source, ingested_at)",
+    # `breaking_events` is the normalized cluster of one or more
+    # scout_signals that together describe ONE real-world event. The
+    # `event_id` is a deterministic hash of (top entity, category,
+    # bucketed_hour) so duplicate clusters created on different scan
+    # ticks collapse into the same row — this is the cool-down for
+    # repeat triggers the spec requires.
+    """
+    CREATE TABLE IF NOT EXISTS breaking_events (
+        event_id TEXT PRIMARY KEY,
+        timestamp_detected REAL,
+        title TEXT,
+        category TEXT,
+        severity REAL,
+        confidence REAL,
+        location TEXT,
+        entities TEXT,
+        source_count INTEGER,
+        sources TEXT,
+        contradiction_score REAL,
+        raw_signal_ids TEXT,
+        first_seen_at REAL,
+        last_seen_at REAL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_breaking_events_detected ON breaking_events(timestamp_detected)",
+    "CREATE INDEX IF NOT EXISTS idx_breaking_events_category ON breaking_events(category, timestamp_detected)",
+    # `event_market_candidates` is the audit trail per (Event, Market)
+    # consideration. Status is one of: accepted (a SHADOW position was
+    # opened — `shadow_position_id` is set), rejected (safety rule
+    # rejected — `reject_reason` is set), pending (scored but the lane
+    # hasn't decided yet, transient state).
+    #
+    # Every candidate, accepted or rejected, has a row — that's the
+    # spec contract: "logs explain why each candidate was accepted or
+    # rejected" surfaced in queryable form.
+    """
+    CREATE TABLE IF NOT EXISTS event_market_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT,
+        market_id TEXT,
+        considered_at REAL,
+        status TEXT,
+        reject_reason TEXT,
+        side TEXT,
+        true_prob REAL,
+        confidence REAL,
+        edge REAL,
+        market_mid REAL,
+        impact_snapshot TEXT,
+        shadow_position_id INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_event_candidates_event ON event_market_candidates(event_id)",
+    "CREATE INDEX IF NOT EXISTS idx_event_candidates_market ON event_market_candidates(market_id, considered_at)",
+    "CREATE INDEX IF NOT EXISTS idx_event_candidates_considered ON event_market_candidates(considered_at)",
 ]
 
 
