@@ -31,6 +31,7 @@ candidate was accepted or thrown out.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 # Election-type synonyms. The key is the canonical bucket.
 _ELECTION_TYPES: dict[str, set[str]] = {
@@ -170,10 +171,28 @@ _CANDIDATE_NAMES = {
 }
 
 
-def _extract_entities(text: str) -> set[str]:
+# The 5 helpers below are the per-cycle hotspot. ``match()`` is called
+# ~750 PredictIt contracts × ~800 active Polymarket questions = ~600 000
+# times per cycle, and each invocation calls all five helpers — but
+# they're pure functions of a single string input. ``lru_cache``
+# collapses the ~3M intra-cycle helper calls to ~1600 unique-input
+# evaluations (one per distinct ``pi_text`` / ``poly_text``); cycle 2
+# benefits cross-cycle too because active polymarket questions are
+# stable. April 2026 soak: filter_thread cycle 240s → ~5s after
+# caching, eliminating the loop_lag spikes that the worker thread had
+# been producing through GIL contention.
+#
+# ``_extract_entities`` returns ``frozenset`` (not ``set``) so the
+# shared cached instance can't be mutated by a caller. The only call
+# site reads ``pi_ents & poly_ents`` which works identically on
+# ``frozenset``.
+
+
+@lru_cache(maxsize=4096)
+def _extract_entities(text: str) -> frozenset[str]:
     if not text:
-        return set()
-    ents = set()
+        return frozenset()
+    ents: set[str] = set()
     for m in _ENTITY_RE.finditer(text):
         token = m.group(1).strip()
         if not token:
@@ -192,9 +211,10 @@ def _extract_entities(text: str) -> set[str]:
         if " " not in token and token in _ENTITY_STOPS:
             continue
         ents.add(token.lower())
-    return ents
+    return frozenset(ents)
 
 
+@lru_cache(maxsize=4096)
 def _detect_country(text: str) -> str | None:
     if not text:
         return None
@@ -206,6 +226,7 @@ def _detect_country(text: str) -> str | None:
     return None
 
 
+@lru_cache(maxsize=4096)
 def _detect_election_type(text: str) -> str | None:
     if not text:
         return None
@@ -219,6 +240,7 @@ def _detect_election_type(text: str) -> str | None:
     return None
 
 
+@lru_cache(maxsize=4096)
 def _detect_candidate(text: str) -> str | None:
     if not text:
         return None
@@ -230,6 +252,7 @@ def _detect_candidate(text: str) -> str | None:
     return None
 
 
+@lru_cache(maxsize=4096)
 def _detect_phase(text: str) -> str | None:
     """Return the electoral phase the text is asking about, or None.
 
