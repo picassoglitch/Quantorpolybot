@@ -12,7 +12,9 @@ from core.markets.discovery import MarketDiscovery
 from core.optimization.auto_tune import run as run_auto_tune
 from core.optimization.lane_rebalancer import rebalance as rebalance_lanes
 from core.state.health import run_all as run_health_checks
+from core.strategies.evidence_tier import purge_skips_older_than
 from core.utils.config import get_config
+from core.utils.helpers import safe_float
 
 
 class JobScheduler:
@@ -76,6 +78,19 @@ class JobScheduler:
             replace_existing=True,
             max_instances=1,
         )
+        # Step #2: nightly purge of scan_skips. Reads TTL from
+        # `scan_skips.ttl_days` (default 7d). Wrapped in a thin
+        # closure so the cron job factory doesn't need to know the
+        # config layout.
+        self.scheduler.add_job(
+            self._safe(_purge_scan_skips, "scan_skips_purge"),
+            CronTrigger.from_crontab(
+                cfg.get("scan_skips_purge_cron", "40 4 * * *")
+            ),
+            id="scan_skips_purge",
+            replace_existing=True,
+            max_instances=1,
+        )
         self.scheduler.start()
         logger.info("[scheduler] started with {} jobs", len(self.scheduler.get_jobs()))
 
@@ -92,3 +107,18 @@ class JobScheduler:
             except Exception as e:
                 logger.exception("[scheduler] job {} failed: {}", label, e)
         return runner
+
+
+async def _purge_scan_skips() -> None:
+    """Read TTL from config and delete older rows. Logs the rowcount so
+    the operator sees the purge happened (and how big the table got)."""
+    cfg = get_config().get("scan_skips") or {}
+    ttl_days = safe_float(cfg.get("ttl_days", 7.0))
+    if ttl_days <= 0:
+        logger.info("[scan_skips] purge disabled (ttl_days <= 0)")
+        return
+    seconds = ttl_days * 86400.0
+    deleted = await purge_skips_older_than(seconds)
+    logger.info(
+        "[scan_skips] purged {} rows older than {}d", deleted, ttl_days,
+    )
