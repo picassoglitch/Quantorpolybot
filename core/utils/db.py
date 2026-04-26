@@ -17,9 +17,15 @@ from core.utils.config import get_config, root_dir
 # raising SQLITE_BUSY. WAL mode handles concurrent readers natively;
 # this covers the write-write race across coroutines / threads / loops.
 # Applied per-connection (see _PRAGMAS + connect()) because these are
-# all connection-local pragmas. 30s absorbs the discovery refresh's
-# bulk-UPDATE window without bleeding into feed/monitor writers.
-_BUSY_TIMEOUT_MS = 30_000
+# all connection-local pragmas.
+#
+# Bumped from 30s to 60s after the April 2026 soak: predictit and
+# google_news both emitted ``OperationalError: database is locked``
+# within ~50s of startup despite WAL mode, which means a single writer
+# was holding the DB longer than 30s under boot-time load (signals
+# pipeline catch-up + bulk discovery + feed ingest concurrent).
+# 60s gives those long writes more room before bubbling up an error.
+_BUSY_TIMEOUT_MS = 60_000
 
 # Pragmas applied on EVERY fresh connection. synchronous=NORMAL + WAL
 # is the safe fast-commit combo; default synchronous=FULL forces an
@@ -28,12 +34,18 @@ _BUSY_TIMEOUT_MS = 30_000
 # discovery module's TEMP tables off disk. journal_mode=WAL is
 # persistent at the file level, so this is a no-op after init_db
 # but costs nothing to re-assert.
+#
+# wal_autocheckpoint=1000 keeps the WAL file from growing unbounded
+# under the boot-time write storm. Default is 1000 already on most
+# builds, but explicit is better here so we don't depend on a build
+# default.
 _PRAGMAS: tuple[str, ...] = (
     f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}",
     "PRAGMA journal_mode=WAL",
     "PRAGMA synchronous=NORMAL",
     "PRAGMA temp_store=MEMORY",
     "PRAGMA cache_size=-8000",
+    "PRAGMA wal_autocheckpoint=1000",
 )
 
 _DB_PATH: Path | None = None

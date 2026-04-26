@@ -131,6 +131,58 @@ def circuit_is_open(tier: str) -> bool:
     return time.monotonic() < state.open_until and not state.is_half_open
 
 
+def circuit_state(tier: str) -> str:
+    """Return one of ``"CLOSED"``, ``"OPEN"``, ``"HALF_OPEN"``. Used
+    by the watchdog to distinguish "Ollama is intentionally paused"
+    from "Ollama should be responding but isn't"."""
+    state = _circuit.get(tier)
+    if state is None:
+        return "CLOSED"
+    if state.is_half_open:
+        return "HALF_OPEN"
+    if time.monotonic() < state.open_until:
+        return "OPEN"
+    return "CLOSED"
+
+
+def circuit_cooldown_remaining(tier: str) -> float:
+    """Seconds until the open circuit transitions to HALF_OPEN. Returns
+    0 when the circuit is already closed/half-open."""
+    state = _circuit.get(tier)
+    if state is None:
+        return 0.0
+    remaining = state.open_until - time.monotonic()
+    return max(0.0, remaining)
+
+
+def all_tier_circuit_states() -> dict[str, dict[str, float | str]]:
+    """One-shot snapshot of every tier's circuit state for the
+    watchdog log line. Returns a dict like::
+
+        {"fast": {"state": "CLOSED", "cooldown_remaining": 0.0,
+                  "open_count": 0},
+         "deep": {"state": "OPEN",  "cooldown_remaining": 42.0,
+                  "open_count": 3},
+         "validator": {...}}
+    """
+    out: dict[str, dict[str, float | str]] = {}
+    for tier in _TIERS:
+        state = _circuit[tier]
+        out[tier] = {
+            "state": circuit_state(tier),
+            "cooldown_remaining": circuit_cooldown_remaining(tier),
+            "open_count": state.open_count,
+        }
+    return out
+
+
+def any_circuit_open() -> bool:
+    """True if at least one tier's circuit is in OPEN state. The
+    watchdog uses this to interpret 'Ollama silent' as 'heuristic
+    only by design' rather than 'system is degraded'."""
+    return any(circuit_state(t) == "OPEN" for t in _TIERS)
+
+
 def _record_circuit_success(tier: str) -> None:
     state = _circuit[tier]
     if state.consecutive_failures > 0 or state.is_half_open or state.open_until > 0:
@@ -526,9 +578,17 @@ class OllamaClient:
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             meta["latency_ms"] = elapsed_ms
             meta["error"] = "TimeoutError"
+            # Move the worker from "in flight" to "abandoned" right
+            # away. Python can't pre-empt a sync HTTP call from another
+            # thread, so the worker keeps running until its own sync
+            # timeout — but as far as the bot is concerned, this call
+            # is dead. Reporting it as in-flight made the watchdog
+            # think Ollama was still processing for 30+ seconds after
+            # the asyncio side gave up.
+            ollama_executor.abandon(call_type, request_id)
             logger.warning(
                 "[ollama] tier={} req={} model={} tag={} latency_ms={:.0f} "
-                "TIMEOUT (asyncio.wait_for >{:.1f}s)",
+                "TIMEOUT (asyncio.wait_for >{:.1f}s); worker abandoned",
                 call_type, request_id, model, tag or "-", elapsed_ms, timeout,
             )
             self._record_failure(call_type, error="TimeoutError")
@@ -538,6 +598,7 @@ class OllamaClient:
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             meta["latency_ms"] = elapsed_ms
             meta["error"] = type(e).__name__
+            ollama_executor.abandon(call_type, request_id)
             logger.warning(
                 "[ollama] tier={} req={} model={} tag={} unexpected: {}",
                 call_type, request_id, model, tag or "-", e,
@@ -693,9 +754,11 @@ class OllamaClient:
                 aio_future, timeout=timeout,
             )
         except asyncio.TimeoutError:
+            ollama_executor.abandon("deep", request_id)
             self._record_failure("deep", error="TimeoutError")
             return ""
         except Exception as e:
+            ollama_executor.abandon("deep", request_id)
             self._record_failure("deep", error=type(e).__name__)
             return ""
         if result.data is None:

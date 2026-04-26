@@ -136,11 +136,40 @@ class App:
         busy_timeout, see core/utils/db.py). No cross-loop asyncio
         primitives cross the boundary — each loop opens its own
         connections.
+
+        Port-conflict handling: a previous bot process (or anything
+        else) may already own the configured port. The April 2026 soak
+        showed uvicorn's bind error gets buried in the log and the
+        rest of the bot keeps running with no dashboard. We pre-probe
+        with a synchronous bind, and on conflict we walk forward up to
+        ``DASHBOARD_PORT_RETRIES`` ports before giving up. The chosen
+        port is logged loudly so the operator knows where to point
+        their browser.
         """
+        import socket
+
         from dashboard.app import create_app
 
         host = env("DASHBOARD_HOST", get_config().get("dashboard", "host", default="127.0.0.1"))
-        port = int(env("DASHBOARD_PORT", str(get_config().get("dashboard", "port", default=8000))))
+        configured_port = int(
+            env("DASHBOARD_PORT", str(get_config().get("dashboard", "port", default=8000)))
+        )
+        retries = int(get_config().get("dashboard", "port_retries", default=5))
+        port = _find_open_port(host, configured_port, retries=retries)
+        if port is None:
+            logger.error(
+                "[dashboard] could not bind to any port in {}..{} on {} — "
+                "is another bot instance already running? "
+                "Set DASHBOARD_PORT to an explicit free port to override.",
+                configured_port, configured_port + retries, host,
+            )
+            return
+        if port != configured_port:
+            logger.warning(
+                "[dashboard] port {} was busy on {}; rolled forward to {}",
+                configured_port, host, port,
+            )
+
         config = uvicorn.Config(
             create_app(),
             host=host,
@@ -213,6 +242,34 @@ class App:
 
     def request_stop(self) -> None:
         self._stop.set()
+
+
+def _find_open_port(host: str, start: int, *, retries: int = 5) -> int | None:
+    """Try to bind ``host:start``; on EADDRINUSE walk forward up to
+    ``retries`` more ports. Returns the first free port or ``None``
+    if all are busy. The probe is synchronous + immediate (no listen
+    backlog), so it's safe to call before uvicorn binds for real.
+
+    Uvicorn doesn't give us a clean "did it bind?" hook before the
+    server starts serving, so this pre-check is the only reliable way
+    to fail loudly on port conflicts. The April 2026 soak showed
+    uvicorn's [Errno 10048] just printed to stderr and the bot
+    continued without a dashboard, which is silent corruption."""
+    import socket
+
+    for offset in range(retries + 1):
+        port = start + offset
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+        except OSError:
+            continue
+        else:
+            return port
+        finally:
+            s.close()
+    return None
 
 
 def _install_signal_handlers(app: App, loop: asyncio.AbstractEventLoop) -> None:

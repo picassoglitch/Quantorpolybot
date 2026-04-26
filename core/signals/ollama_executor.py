@@ -77,6 +77,14 @@ _thread_local = threading.local()
 # lock, we're orders of magnitude below the network call itself.
 _inflight_lock = threading.Lock()
 _inflight: dict[str, dict[str, float]] = {t: {} for t in _TIERS}
+# Abandoned tracking: when the asyncio side gives up via wait_for, the
+# request is moved here so the worker thread (which Python cannot
+# pre-empt) doesn't keep counting against in-flight metrics. The
+# watchdog reads this separately so "5 abandoned workers still
+# draining" doesn't get misreported as "5 calls in flight, system
+# busy". Worker auto-removes its own entry when the sync side
+# eventually finishes.
+_abandoned: dict[str, dict[str, float]] = {t: {} for t in _TIERS}
 
 
 def _ollama_cfg() -> dict[str, Any]:
@@ -209,8 +217,39 @@ def _do_post(
             queue_depth_at_dispatch=queue_depth,
         )
     finally:
+        # Always clear from BOTH trackers in the worker's finally so
+        # late-arriving completions from previously-abandoned calls
+        # don't leave stale entries.
         with _inflight_lock:
             _inflight[tier].pop(request_id, None)
+            _abandoned[tier].pop(request_id, None)
+
+
+def abandon(tier: str, request_id: str) -> None:
+    """Called from the asyncio side when ``wait_for`` fires before the
+    worker thread completes. Moves the request from in-flight to
+    abandoned so metrics reflect "the loop has given up; the thread
+    is still draining" rather than "this call is still active".
+
+    The worker thread itself doesn't know it was abandoned and keeps
+    running until its sync_timeout. When it finishes (success OR
+    failure), the ``finally`` in ``_do_post`` removes the entry from
+    both maps so no stale state lingers."""
+    with _inflight_lock:
+        started = _inflight[tier].pop(request_id, None)
+        if started is not None:
+            _abandoned[tier][request_id] = started
+
+
+def abandoned_count(tier: str | None = None) -> int:
+    """Watchdog helper: total abandoned workers (across all tiers
+    unless one is named) currently draining in the background.
+    A growing count means Ollama is timing out a lot AND the sync
+    timeout hasn't fired yet — useful for "the GPU is hung" triage."""
+    with _inflight_lock:
+        if tier is None:
+            return sum(len(v) for v in _abandoned.values())
+        return len(_abandoned.get(tier, {}))
 
 
 def submit_generate(
@@ -238,13 +277,20 @@ def _inflight_count(tier: str) -> int:
 
 @dataclass
 class InFlightSnapshot:
-    """Watchdog-friendly view of the executor state. ``stuck`` is the
-    list of (tier, request_id, age_seconds) for any in-flight call that
-    has been running longer than ``stuck_age_seconds`` — those are
-    candidates for "the loop appears blocked but actually it's a thread
-    that won't die" diagnoses."""
+    """Watchdog-friendly view of the executor state.
+
+    - ``per_tier_in_flight``: calls the asyncio side is still awaiting.
+    - ``per_tier_abandoned``: calls the asyncio side has given up on
+      (``wait_for`` fired) but whose worker thread is still draining
+      until its sync timeout. These DON'T count as active work — they're
+      a "dead but not yet buried" cohort.
+    - ``stuck``: in-flight calls older than ``stuck_age_seconds`` —
+      candidates for "the loop says X is running but it's really hung
+      on the GPU" triage.
+    """
 
     per_tier_in_flight: dict[str, int] = field(default_factory=dict)
+    per_tier_abandoned: dict[str, int] = field(default_factory=dict)
     stuck: list[tuple[str, str, float]] = field(default_factory=list)
 
 
@@ -258,6 +304,8 @@ def in_flight_snapshot(stuck_age_seconds: float = 30.0) -> InFlightSnapshot:
                 age = now - started
                 if age >= stuck_age_seconds:
                     snap.stuck.append((tier, rid, age))
+        for tier, rid_to_started in _abandoned.items():
+            snap.per_tier_abandoned[tier] = len(rid_to_started)
     return snap
 
 
@@ -273,6 +321,7 @@ def reset_for_tests() -> None:
     with _inflight_lock:
         for tier in _TIERS:
             _inflight[tier].clear()
+            _abandoned[tier].clear()
 
 
 def shutdown(wait: bool = True) -> None:
