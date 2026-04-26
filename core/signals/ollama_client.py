@@ -89,20 +89,45 @@ def _ollama_cfg() -> dict[str, Any]:
 
 
 class _CircuitState:
+    """Three-state breaker: CLOSED (healthy) / OPEN (denying calls) /
+    HALF_OPEN (admitting one probe).
+
+    Important invariant after the April 2026 step-1.7 fix: the breaker
+    flips to CLOSED **only** when a half-open probe succeeds. Cooldown
+    elapsing on its own does NOT close the circuit — the next call is
+    promoted to HALF_OPEN as a probe, and either:
+      - probe succeeds → CLOSED (logged "circuit CLOSED tier=X after
+        successful probe")
+      - probe fails    → OPEN with longer cooldown (logged
+        "circuit RE-OPENED tier=X (probe failed: ...)")
+
+    This eliminates the soak-time confusion where the watchdog saw
+    ``deep:CLOSED`` while Ollama was still timing out — the previous
+    state machine returned CLOSED any time ``open_until`` had elapsed,
+    regardless of whether anything had actually verified recovery."""
+
     __slots__ = (
         "consecutive_failures",
         "open_until",
         "is_half_open",
+        "is_closed",
         "open_count",
     )
 
     def __init__(self) -> None:
         self.consecutive_failures: int = 0
         # Monotonic timestamp; calls before this return None instantly.
+        # (Only meaningful when ``is_closed`` is False.)
         self.open_until: float = 0.0
-        # When True, the next call is a probe — only one in-flight
-        # probe at a time (guarded by ``_probe_in_flight`` below).
+        # True iff the breaker has admitted a half-open probe and is
+        # awaiting its outcome. Only one probe per tier at a time,
+        # guarded by ``_probe_in_flight`` below.
         self.is_half_open: bool = False
+        # Authoritative "calls may flow" flag. Defaults True at boot
+        # and after a successful probe. Set False on circuit opening.
+        # No code path other than the success handler clears this back
+        # to True — that's the whole point of the rewrite.
+        self.is_closed: bool = True
         # Number of times the breaker has opened in this process —
         # surfaced in logs to make repeated outages obvious in triage.
         self.open_count: int = 0
@@ -124,32 +149,33 @@ def _circuit_open_seconds() -> float:
 
 def circuit_is_open(tier: str) -> bool:
     """Public read for callers that want to short-circuit BEFORE
-    incurring a heuristic-fallback build (e.g. dashboard health card)."""
-    state = _circuit.get(tier)
-    if state is None:
-        return False
-    return time.monotonic() < state.open_until and not state.is_half_open
+    incurring a heuristic-fallback build. Returns True iff the
+    breaker is in the OPEN state — HALF_OPEN admits the next call as
+    a probe so it returns False (the caller should still attempt)."""
+    return circuit_state(tier) == "OPEN"
 
 
 def circuit_state(tier: str) -> str:
-    """Return one of ``"CLOSED"``, ``"OPEN"``, ``"HALF_OPEN"``. Used
-    by the watchdog to distinguish "Ollama is intentionally paused"
-    from "Ollama should be responding but isn't"."""
+    """Return one of ``"CLOSED"``, ``"OPEN"``, ``"HALF_OPEN"``.
+
+    Step-1.7 invariant: CLOSED is reached **only** via
+    ``_record_circuit_success`` (typically a half-open probe
+    succeeding). Cooldown elapsing on its own does not close the
+    circuit; the state stays OPEN until a probe verifies recovery."""
     state = _circuit.get(tier)
-    if state is None:
+    if state is None or state.is_closed:
         return "CLOSED"
     if state.is_half_open:
         return "HALF_OPEN"
-    if time.monotonic() < state.open_until:
-        return "OPEN"
-    return "CLOSED"
+    return "OPEN"
 
 
 def circuit_cooldown_remaining(tier: str) -> float:
-    """Seconds until the open circuit transitions to HALF_OPEN. Returns
-    0 when the circuit is already closed/half-open."""
+    """Seconds until ``_circuit_admit`` will promote the next call to
+    a half-open probe. 0 means "next call IS the probe". Returns 0
+    when the circuit is already closed/half-open."""
     state = _circuit.get(tier)
-    if state is None:
+    if state is None or state.is_closed:
         return 0.0
     remaining = state.open_until - time.monotonic()
     return max(0.0, remaining)
@@ -185,14 +211,21 @@ def any_circuit_open() -> bool:
 
 def _record_circuit_success(tier: str) -> None:
     state = _circuit[tier]
-    if state.consecutive_failures > 0 or state.is_half_open or state.open_until > 0:
-        logger.info(
-            "[ollama] circuit CLOSED tier={} (was open_count={})",
-            tier, state.open_count,
-        )
+    was_not_closed = (not state.is_closed) or state.is_half_open
+    if was_not_closed:
+        if state.is_half_open:
+            logger.info(
+                "[ollama] circuit CLOSED tier={} after successful probe "
+                "(was open_count={})",
+                tier, state.open_count,
+            )
+        else:
+            # First success of a fresh client / boot path. Quiet INFO.
+            logger.debug("[ollama] circuit CLOSED tier={} (initial)", tier)
     state.consecutive_failures = 0
     state.open_until = 0.0
     state.is_half_open = False
+    state.is_closed = True
     _probe_in_flight[tier] = False
 
 
@@ -207,6 +240,7 @@ def _record_circuit_failure(tier: str, error: str) -> None:
         state.open_until = time.monotonic() + cooldown * 2
         state.open_count += 1
         state.is_half_open = False
+        state.is_closed = False  # stays open
         _probe_in_flight[tier] = False
         logger.warning(
             "[ollama] circuit RE-OPENED tier={} (probe failed: {}); "
@@ -214,9 +248,10 @@ def _record_circuit_failure(tier: str, error: str) -> None:
             tier, error, cooldown * 2, state.open_count,
         )
         return
-    if state.consecutive_failures >= threshold and state.open_until == 0.0:
+    if state.consecutive_failures >= threshold and state.is_closed:
         state.open_until = time.monotonic() + cooldown
         state.open_count += 1
+        state.is_closed = False
         logger.warning(
             "[ollama] circuit OPENED tier={} after {} consecutive failures; "
             "cooldown={:.0f}s open_count={}",
@@ -229,21 +264,20 @@ def _circuit_admit(tier: str) -> tuple[bool, bool]:
 
     Returns ``(admit, is_probe)``. When ``admit`` is False, the caller
     must short-circuit to None without dispatching. ``is_probe`` is
-    True iff the breaker is half-open and this call was selected as
-    the recovery probe — the caller still dispatches normally; the
-    flag affects how we record success/failure afterwards.
+    True iff the breaker was OPEN with elapsed cooldown and this call
+    was selected as the recovery probe — the caller still dispatches
+    normally; the flag affects how we record success/failure
+    afterwards.
     """
     state = _circuit.get(tier)
-    if state is None:
+    if state is None or state.is_closed:
         return True, False
     now = time.monotonic()
-    if state.open_until == 0.0:
-        return True, False
+    # Still in cooldown: deny.
     if now < state.open_until:
-        # Still inside the cooldown window: deny.
         return False, False
-    # Window elapsed — admit ONE caller as a probe; everyone else
-    # waits for the probe outcome.
+    # Cooldown elapsed. Promote one caller to half-open probe; deny
+    # any concurrent caller until the probe resolves.
     if state.is_half_open and _probe_in_flight[tier]:
         return False, False
     state.is_half_open = True
@@ -575,8 +609,10 @@ class OllamaClient:
                 aio_future, timeout=timeout,
             )
         except asyncio.TimeoutError:
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            meta["latency_ms"] = elapsed_ms
+            wait_ms = (time.perf_counter() - start) * 1000.0
+            budget_ms = timeout * 1000.0
+            overrun_ms = max(0.0, wait_ms - budget_ms)
+            meta["latency_ms"] = wait_ms
             meta["error"] = "TimeoutError"
             # Move the worker from "in flight" to "abandoned" right
             # away. Python can't pre-empt a sync HTTP call from another
@@ -586,34 +622,48 @@ class OllamaClient:
             # think Ollama was still processing for 30+ seconds after
             # the asyncio side gave up.
             ollama_executor.abandon(call_type, request_id)
+            # Split metric: ``wait_ms`` is time the asyncio side spent
+            # in ``wait_for``; ``budget_ms`` is the configured tier
+            # timeout; ``overrun_ms`` quantifies how late the asyncio
+            # timer fired (typically GIL contention or the loop being
+            # busy with other callbacks). The April 2026 soak showed
+            # wait_ms reaching 35-45s on a 20s budget, which the old
+            # log line collapsed into a single "latency_ms=35412"
+            # field that looked like a slow Ollama instead of an
+            # overrun event.
             logger.warning(
-                "[ollama] tier={} req={} model={} tag={} latency_ms={:.0f} "
-                "TIMEOUT (asyncio.wait_for >{:.1f}s); worker abandoned",
-                call_type, request_id, model, tag or "-", elapsed_ms, timeout,
+                "[ollama] tier={} req={} model={} tag={} TIMEOUT "
+                "wait_ms={:.0f} budget={:.0f}ms overrun={:.0f}ms; "
+                "worker abandoned (still draining)",
+                call_type, request_id, model, tag or "-",
+                wait_ms, budget_ms, overrun_ms,
             )
             self._record_failure(call_type, error="TimeoutError")
             await self._log_stat(meta)
             return None, meta
         except Exception as e:
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            meta["latency_ms"] = elapsed_ms
+            wait_ms = (time.perf_counter() - start) * 1000.0
+            meta["latency_ms"] = wait_ms
             meta["error"] = type(e).__name__
             ollama_executor.abandon(call_type, request_id)
             logger.warning(
-                "[ollama] tier={} req={} model={} tag={} unexpected: {}",
-                call_type, request_id, model, tag or "-", e,
+                "[ollama] tier={} req={} model={} tag={} wait_ms={:.0f} "
+                "unexpected: {}",
+                call_type, request_id, model, tag or "-", wait_ms, e,
             )
             self._record_failure(call_type, error=type(e).__name__)
             await self._log_stat(meta)
             return None, meta
 
-        meta["latency_ms"] = result.latency_ms
+        wait_ms = (time.perf_counter() - start) * 1000.0
+        meta["latency_ms"] = result.latency_ms  # worker-side timing for the stats table
         if result.data is None:
             meta["error"] = result.error or "EmptyResponse"
             logger.debug(
-                "[ollama] tier={} req={} model={} tag={} latency_ms={:.0f} "
-                "queue_depth={} success=false error={}",
-                call_type, request_id, model, tag or "-", result.latency_ms,
+                "[ollama] tier={} req={} model={} tag={} wait_ms={:.0f} "
+                "worker_ms={:.0f} queue_depth={} success=false error={}",
+                call_type, request_id, model, tag or "-",
+                wait_ms, result.latency_ms,
                 queue_depth_at_dispatch, meta["error"],
             )
             self._explain_failure(meta["error"], model)
@@ -632,10 +682,11 @@ class OllamaClient:
         meta["raw_text"] = text
         parsed = self._extract_json(text) if response_format == "json" else None
         logger.debug(
-            "[ollama] tier={} req={} model={} tag={} latency_ms={:.0f} "
-            "queue_depth={} success=true tokens_in={} tokens_out={} "
-            "circuit_probe={}",
-            call_type, request_id, model, tag or "-", result.latency_ms,
+            "[ollama] tier={} req={} model={} tag={} wait_ms={:.0f} "
+            "worker_ms={:.0f} queue_depth={} success=true tokens_in={} "
+            "tokens_out={} circuit_probe={}",
+            call_type, request_id, model, tag or "-",
+            wait_ms, result.latency_ms,
             queue_depth_at_dispatch, meta["tokens_in"], meta["tokens_out"],
             "yes" if is_probe else "no",
         )
@@ -749,12 +800,21 @@ class OllamaClient:
             sync_timeout=sync_timeout, request_id=request_id,
         )
         aio_future = asyncio.wrap_future(cf_future, loop=loop)
+        text_start = time.perf_counter()
         try:
             result: ollama_executor.GenerateResult = await asyncio.wait_for(
                 aio_future, timeout=timeout,
             )
         except asyncio.TimeoutError:
+            wait_ms = (time.perf_counter() - text_start) * 1000.0
+            overrun_ms = max(0.0, wait_ms - timeout * 1000.0)
             ollama_executor.abandon("deep", request_id)
+            logger.warning(
+                "[ollama] tier=deep req={} generate_text TIMEOUT "
+                "wait_ms={:.0f} budget={:.0f}ms overrun={:.0f}ms; "
+                "worker abandoned",
+                request_id, wait_ms, timeout * 1000.0, overrun_ms,
+            )
             self._record_failure("deep", error="TimeoutError")
             return ""
         except Exception as e:

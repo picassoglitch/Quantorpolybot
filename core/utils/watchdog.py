@@ -60,11 +60,22 @@ INTERVAL_SECONDS = 30.0
 # something held the loop's run-to-completion budget too long.
 LOOP_LAG_PROBE_DELAY = 0.5
 # Above this many milliseconds, we declare the loop genuinely blocked.
-# Single-digit milliseconds is normal; tens of ms under load is OK on
-# Windows; hundreds of ms is the threshold where coroutines start
-# missing deadlines visibly. The user's prior "event_loop_blocked"
-# false positives were all <5ms when lag was actually measured.
-LOOP_LAG_BLOCKED_MS = 250.0
+# Bumped 250 -> 500 after the April 2026 step-1.7 soak: a single 267ms
+# blip during normal lane churn is not a degradation event, and
+# trip-on-first-spike caused the watchdog to enter DEGRADED for a
+# 17ms-over-threshold breach during a healthy minute.
+LOOP_LAG_BLOCKED_MS = 500.0
+# Number of consecutive lag breaches required before flipping
+# DEGRADED. A trading bot should not degrade on a single blip — the
+# loop is allowed one bad tick (e.g. boot-time discovery + WS
+# subscribe burning CPU + DB writes) without crying wolf.
+CONSECUTIVE_LAG_BREACHES_TO_DEGRADE = 2
+# Seconds after watchdog start during which lag breaches log INFO but
+# do NOT count toward DEGRADED. The very first tick after boot
+# legitimately shows 1-2 seconds of lag because every subsystem (9
+# feeds + WS + market discovery + signal pipeline + 3 lanes) is
+# initialising at once. The 30s grace covers that ramp-up cleanly.
+STARTUP_GRACE_SECONDS = 30.0
 
 # ---- Ollama silence thresholds ----
 # Both apply ONLY when no tier circuit is OPEN. When a circuit is open,
@@ -79,7 +90,11 @@ WS_RECONNECT_STRIKES_BEFORE_BACKOFF = 3
 WS_HARD_BACKOFF_SECONDS = 120.0
 
 # Number of consecutive healthy ticks before we flip DEGRADED back off.
-HEALTHY_CONFIRM_TICKS = 6
+# Dropped 6 -> 3 (90s recovery) after the step-1.7 soak: a healthy
+# heuristic_only mode with low loop_lag was sitting in DEGRADED for
+# 3+ minutes after a single 267ms spike. 90s is enough to confirm
+# recovery without trapping the bot in a stale state.
+HEALTHY_CONFIRM_TICKS = 3
 
 # Module-level status flag read by FeedManager / feeds to throttle their
 # poll loops when the event loop is under pressure.
@@ -100,6 +115,11 @@ class Watchdog:
         self._ws_reconnect_strikes = 0
         self._ws_hard_backoff_until = 0.0
         self._healthy_ticks = 0
+        # Counter for consecutive ticks where loop_lag_ms exceeded
+        # ``LOOP_LAG_BLOCKED_MS``. Only flips DEGRADED once it hits
+        # ``CONSECUTIVE_LAG_BREACHES_TO_DEGRADE`` so a single spike
+        # (boot-time discovery, an RSS cycle, etc.) doesn't trigger.
+        self._consecutive_lag_breaches = 0
 
     async def run(self) -> None:
         logger.info("[watchdog] started (interval={:.0f}s)", INTERVAL_SECONDS)
@@ -175,17 +195,38 @@ class Watchdog:
 
         # ---- Real loop-lag measurement ----
         lag_ms = await self._measure_loop_lag_ms()
-        loop_blocked = lag_ms > LOOP_LAG_BLOCKED_MS
+        lag_breach = lag_ms > LOOP_LAG_BLOCKED_MS
+        # Grace window: very early after boot, lots of subsystems are
+        # ramping up concurrently and a 1-2s lag spike is normal. Don't
+        # let it trip DEGRADED — log it at INFO so the operator can
+        # still see it.
+        in_startup_grace = (now - self._started_at) < STARTUP_GRACE_SECONDS
+        if lag_breach:
+            if in_startup_grace:
+                # Reset the counter — we don't want a startup spike to
+                # leave us "1/2 breaches" pending into normal operation.
+                self._consecutive_lag_breaches = 0
+            else:
+                self._consecutive_lag_breaches += 1
+        else:
+            self._consecutive_lag_breaches = 0
+        loop_genuinely_blocked = (
+            self._consecutive_lag_breaches >= CONSECUTIVE_LAG_BREACHES_TO_DEGRADE
+        )
 
         # ---- Snapshot ----
         all_tasks = [t for t in asyncio.all_tasks() if not t.done()]
         pending = len(all_tasks)
 
         last_ollama = ollama_mod.LAST_SUCCESS_TS
-        ollama_age = (now - last_ollama) if last_ollama else None
+        # Clamp to 0: ``now_ts`` (time.time) and ``LAST_SUCCESS_TS``
+        # are both wall-clock seconds, but reads of one and writes of
+        # the other can interleave by tens of microseconds — small
+        # negatives surfaced as ``-0s`` in the soak. Same for ws below.
+        ollama_age = max(0.0, now - last_ollama) if last_ollama else None
 
         last_ws = poly_ws_mod.LAST_MESSAGE_TS
-        ws_age = (now - last_ws) if last_ws else None
+        ws_age = max(0.0, now - last_ws) if last_ws else None
 
         circuit_states = ollama_mod.all_tier_circuit_states()
         any_open = ollama_mod.any_circuit_open()
@@ -215,11 +256,17 @@ class Watchdog:
             f"{ollama_age:.0f}s" if ollama_age is not None else "never"
         )
         ws_silent_str = f"{ws_age:.0f}s" if ws_age is not None else "never"
+        breaches_str = (
+            f" lag_breaches={self._consecutive_lag_breaches}/"
+            f"{CONSECUTIVE_LAG_BREACHES_TO_DEGRADE}"
+            if self._consecutive_lag_breaches > 0 else ""
+        )
         logger.info(
-            "[watchdog] loop_lag_ms={:.0f} ollama_state={} heuristic_only={} "
+            "[watchdog] loop_lag_ms={:.0f}{} ollama_state={} heuristic_only={} "
             "ollama_silent={} ws_silent={} in_flight={} abandoned={} "
             "pending_tasks={} degraded={}",
             lag_ms,
+            breaches_str,
             self._format_circuit_summary(circuit_states),
             heuristic_only,
             ollama_silent_str,
@@ -233,14 +280,34 @@ class Watchdog:
         degraded_this_tick = False
 
         # ---- Loop-lag escalation (the ONLY trustworthy signal) ----
-        if loop_blocked:
+        # Two-stage: first lag breach is a WARN; only after
+        # ``CONSECUTIVE_LAG_BREACHES_TO_DEGRADE`` consecutive breaches
+        # do we ERROR + flip DEGRADED. Inside the startup grace window
+        # we suppress entirely (still INFO-logged via the structured
+        # tick line above).
+        if lag_breach and in_startup_grace:
+            logger.info(
+                "[watchdog] loop_lag_ms={:.0f} during startup grace "
+                "({:.0f}s) — ignoring",
+                lag_ms, STARTUP_GRACE_SECONDS,
+            )
+        elif loop_genuinely_blocked:
             logger.error(
-                "[watchdog] event_loop_blocked: loop_lag_ms={:.0f} "
-                "(threshold {:.0f}ms); pending_tasks={}",
-                lag_ms, LOOP_LAG_BLOCKED_MS, pending,
+                "[watchdog] event_loop_blocked: loop_lag_ms={:.0f} for "
+                "{} consecutive ticks (threshold {:.0f}ms); pending_tasks={}",
+                lag_ms, self._consecutive_lag_breaches,
+                LOOP_LAG_BLOCKED_MS, pending,
             )
             self._emit_diagnostic_dump(all_tasks, lag_ms)
             degraded_this_tick = True
+        elif lag_breach:
+            logger.warning(
+                "[watchdog] loop_lag_ms={:.0f} (single-tick breach "
+                "{}/{}); waiting for confirmation before degrading",
+                lag_ms,
+                self._consecutive_lag_breaches,
+                CONSECUTIVE_LAG_BREACHES_TO_DEGRADE,
+            )
 
         # ---- Ollama silence escalation, GATED by circuit state ----
         # If any circuit is OPEN: silence is intentional. Don't log

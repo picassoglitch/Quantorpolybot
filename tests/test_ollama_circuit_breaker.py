@@ -201,3 +201,78 @@ async def test_open_circuit_on_one_tier_does_not_affect_other(monkeypatch):
     # Fast tier still works.
     result = await client.fast_score("still alive")
     assert result is not None
+
+
+# --- State-machine invariants (April 2026 step-1.7 fix) ---------------
+
+
+@pytest.mark.asyncio
+async def test_circuit_stays_open_after_cooldown_until_probe(monkeypatch):
+    """Cooldown elapsing on its own does NOT close the circuit. Step
+    1.7 invariant: only a successful half-open probe transitions back
+    to CLOSED. Until then ``circuit_state`` reports OPEN.
+
+    The April 2026 soak hit this: at 00:07:12 the watchdog logged
+    ``deep:CLOSED`` while Ollama was still timing out on every call,
+    because the previous implementation used ``time.monotonic() <
+    open_until`` as the OPEN test."""
+    def outcomes(tier, body):
+        return _err_result(tier=tier)
+
+    _patch_outcomes(monkeypatch, outcomes)
+    monkeypatch.setattr(OllamaClient, "_timeout_for", lambda self, t: 1.0)
+
+    client = OllamaClient()
+    for _ in range(3):
+        await client.fast_score("trip")
+    assert ollama_mod.circuit_state("fast") == "OPEN"
+
+    # Wait for cooldown (0.2s in fixture).
+    await asyncio.sleep(0.3)
+
+    # Cooldown has elapsed — ``circuit_cooldown_remaining`` reads 0.
+    assert ollama_mod.circuit_cooldown_remaining("fast") == 0.0
+    # But state is STILL OPEN — no probe has run yet.
+    assert ollama_mod.circuit_state("fast") == "OPEN"
+
+
+@pytest.mark.asyncio
+async def test_circuit_closed_only_after_successful_probe(
+    monkeypatch, caplog,
+):
+    """Only a half-open probe success closes the circuit, and the
+    transition is logged with the explicit ``after successful probe``
+    marker."""
+    from loguru import logger as loguru_logger
+
+    captured: list[str] = []
+    sink_id = loguru_logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        call_count = {"n": 0}
+
+        def outcomes(tier, body):
+            call_count["n"] += 1
+            if call_count["n"] <= 3:
+                return _err_result(tier=tier)
+            return _ok_result()
+
+        _patch_outcomes(monkeypatch, outcomes)
+        monkeypatch.setattr(OllamaClient, "_timeout_for", lambda self, t: 1.0)
+
+        client = OllamaClient()
+        for _ in range(3):
+            await client.fast_score("trip")
+        assert ollama_mod.circuit_state("fast") == "OPEN"
+
+        await asyncio.sleep(0.3)
+        # Probe succeeds → CLOSED with the explicit log marker.
+        result = await client.fast_score("recover")
+        assert result is not None
+        assert ollama_mod.circuit_state("fast") == "CLOSED"
+
+        msgs = "\n".join(captured)
+        assert "after successful probe" in msgs, (
+            "expected explicit 'after successful probe' in CLOSED transition log"
+        )
+    finally:
+        loguru_logger.remove(sink_id)

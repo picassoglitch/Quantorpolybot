@@ -102,10 +102,13 @@ async def test_loop_lag_high_when_loop_blocked(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tick_logs_circuit_states(loguru_sink):
-    # Open the deep circuit by slamming it with failures.
+    # Open the deep circuit explicitly. The April 2026 step-1.7 state
+    # machine requires ``is_closed=False`` to flip to OPEN — cooldown
+    # alone no longer implies open. Tests must mirror that contract.
     state = ollama_mod._circuit["deep"]
     state.consecutive_failures = 99
     state.open_until = time.monotonic() + 30.0
+    state.is_closed = False
 
     w = wd_mod.Watchdog()
     await w._tick()
@@ -133,6 +136,7 @@ async def test_open_circuit_does_not_trigger_ollama_unresponsive(loguru_sink):
         state = ollama_mod._circuit[tier]
         state.consecutive_failures = 99
         state.open_until = time.monotonic() + 60.0
+        state.is_closed = False
 
     w = wd_mod.Watchdog()
     await w._tick()
@@ -149,6 +153,12 @@ async def test_open_circuit_does_not_trigger_ollama_unresponsive(loguru_sink):
 
 @pytest.mark.asyncio
 async def test_real_loop_lag_triggers_degraded(monkeypatch, loguru_sink):
+    """Genuine loop block should escalate to ``event_loop_blocked``
+    + DEGRADED — but only after CONSECUTIVE_LAG_BREACHES_TO_DEGRADE
+    consecutive ticks (default 2) AND outside the startup grace
+    window. The April 2026 step-1.7 soak showed that a single 267ms
+    blip is NOT a trading-bot degradation event, so the previous
+    fire-on-first-breach behaviour was wrong."""
     monkeypatch.setattr(wd_mod, "LOOP_LAG_BLOCKED_MS", 50.0)
 
     async def fake_probe(self):
@@ -157,11 +167,48 @@ async def test_real_loop_lag_triggers_degraded(monkeypatch, loguru_sink):
     monkeypatch.setattr(wd_mod.Watchdog, "_measure_loop_lag_ms", fake_probe)
 
     w = wd_mod.Watchdog()
-    await w._tick()
+    # Skip the startup grace window so the breach actually counts.
+    w._started_at = time.time() - 10000.0
 
+    # First tick: breach 1/2 — WARN, not yet DEGRADED.
+    await w._tick()
+    msgs_after_one = "\n".join(loguru_sink)
+    assert "event_loop_blocked" not in msgs_after_one
+    assert wd_mod.DEGRADED is False
+    assert "single-tick breach" in msgs_after_one or "1/2" in msgs_after_one
+
+    # Second consecutive breach: ERROR + DEGRADED.
+    await w._tick()
     msgs = "\n".join(loguru_sink)
     assert "event_loop_blocked" in msgs
     assert wd_mod.DEGRADED is True
+
+
+@pytest.mark.asyncio
+async def test_startup_grace_suppresses_lag_breach(monkeypatch, loguru_sink):
+    """Within ``STARTUP_GRACE_SECONDS`` of watchdog start, a lag
+    breach must NOT count toward DEGRADED — the very first tick
+    after boot legitimately measures 1-2s of lag while every
+    subsystem ramps up."""
+    monkeypatch.setattr(wd_mod, "LOOP_LAG_BLOCKED_MS", 50.0)
+    monkeypatch.setattr(wd_mod, "STARTUP_GRACE_SECONDS", 60.0)
+
+    async def fake_probe(self):
+        return 2000.0  # 2s spike, like the real boot lag
+
+    monkeypatch.setattr(wd_mod.Watchdog, "_measure_loop_lag_ms", fake_probe)
+
+    w = wd_mod.Watchdog()
+    # _started_at is now() — well within the grace window.
+    await w._tick()
+    await w._tick()  # even two ticks shouldn't degrade during grace
+    msgs = "\n".join(loguru_sink)
+    assert "event_loop_blocked" not in msgs
+    assert "during startup grace" in msgs
+    assert wd_mod.DEGRADED is False
+    # Counter must not accumulate during grace, otherwise the first
+    # post-grace breach would immediately trigger.
+    assert w._consecutive_lag_breaches == 0
 
 
 # ---- 5. Abandoned workers don't count as in-flight ------------------
