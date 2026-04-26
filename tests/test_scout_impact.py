@@ -95,12 +95,21 @@ def test_resignation_buys_yes_on_resigns_market():
     assert impact.direction == 1
 
 
-def test_unknown_polarity_returns_zero_direction():
+def test_unknown_polarity_with_low_severity_returns_zero_confidence():
+    """When polarity inference fails AND severity/match are below
+    the observed-mode thresholds, confidence is hard zero (true
+    no-signal — candidate evaluator rejects as polarity_unknown).
+    See tests/test_scout_impact_v2.py for the high-severity
+    observed-mode path that was added in PR #7."""
     market = _market("Some unrelated market question", mid=0.50)
-    impact = score_impact(_event(EventCategory.MACRO_DATA_SURPRISE), _match(market))
-    # MACRO_DATA_SURPRISE has no polarity rules in v1.
+    # Force severity below the observed-mode threshold (0.60) so
+    # the scorer returns the true zero-signal shape, not the
+    # observed-mode watchlist shape.
+    low_sev_event = _event(EventCategory.MACRO_DATA_SURPRISE, severity=0.40)
+    impact = score_impact(low_sev_event, _match(market))
     assert impact.direction == 0
     assert impact.confidence == 0.0
+    assert impact.observed is False
 
 
 # ---------------- Magnitude / severity ----------------
