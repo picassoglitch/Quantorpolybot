@@ -100,6 +100,20 @@ scalping:
   monitor_seconds: 30
   candidate_pool_size: 300
   scan_cap: 40
+  # ---- Price-band pre-filter ----
+  # Drop markets at extreme tails BEFORE scoring. min_edge is an
+  # absolute threshold (default 0.04); on a market at mid=0.001 even
+  # a 30x mispricing call buys only 0.03 of edge — mathematically
+  # below 0.04 absolute. Without this filter, the liquid 2-14d pool
+  # is dominated by near-settlement "Will X happen by date Y?"
+  # lottery markets clustered at mid<0.01 and mid>=0.99, where the
+  # absolute-edge gate is unreachable and the LLM (correctly)
+  # refuses to claim large mispricings. Tune narrower (e.g. 0.10–0.90)
+  # if the lane consistently grabs marginal-edge entries near the
+  # boundaries; widen if the kept-bucket is starved.
+  price_band:
+    min_mid: 0.05
+    max_mid: 0.95
   # ---- Step #2: evidence tiering ----
   # The scalping lane previously skipped any market without at least
   # `min_evidence_sources` distinct news sources, which on the April
