@@ -83,30 +83,121 @@ GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 _BACKOFF_BASE_SECONDS = 60.0
 _BACKOFF_CAP_SECONDS = 30 * 60.0
 
-# Per-category GDELT search queries. GDELT's query language supports
-# boolean OR / AND, exact-phrase quoting. The queries are intentionally
-# focused — overly-broad queries get rejected as ambiguous, overly-
-# complex queries fail validation. Keep ≤ 5 OR-terms per query.
+# Per-category GDELT search queries.
+#
+# CRITICAL: GDELT's query parser REQUIRES parentheses around any
+# OR'd terms ("Queries containing OR'd terms must be surrounded by
+# (). "). A bare `"a" OR "b"` is rejected with HTTP 200 + text/html.
+# `_validate_query_syntax()` runs on import and on every fetch to
+# enforce this — adding a new query without parens will fail at
+# import time, not silently in production.
+#
+# Single-phrase queries (no OR) don't need parens. Multi-phrase
+# queries with OR DO. If a future query mixes AND with OR groups
+# each OR-group needs its own parens: `(a OR b) AND (c OR d)`.
 _CATEGORY_QUERIES: dict[EventCategory, str] = {
-    EventCategory.SHOOTING: '"shooting" OR "gunman" OR "active shooter"',
-    EventCategory.ASSASSINATION_ATTEMPT: '"assassination attempt" OR "attempted assassination"',
-    EventCategory.EVACUATION: '"evacuation" OR "evacuated" OR "evacuate"',
-    EventCategory.DEATH_INJURY: '"killed in" OR "wounded in" OR "fatally shot"',
-    EventCategory.RESIGNATION: '"resigned" OR "resignation" OR "stepping down"',
-    EventCategory.ARREST: '"arrested" OR "in custody" OR "detained by police"',
-    EventCategory.INDICTMENT: '"indicted" OR "indictment" OR "charged with"',
-    EventCategory.WAR_ESCALATION: '"airstrike" OR "missile strike" OR "invasion"',
-    EventCategory.CEASEFIRE: '"ceasefire" OR "truce" OR "peace deal"',
-    EventCategory.ELECTION_RESULT: '"wins election" OR "election results" OR "concedes"',
-    EventCategory.COURT_RULING: '"supreme court ruling" OR "court ruled" OR "verdict"',
-    EventCategory.MACRO_DATA_SURPRISE: '"jobs report" OR "rate cut" OR "rate hike" OR "Fed decision"',
-    EventCategory.SPORTS_INJURY: '"out for season" OR "ruled out" OR "torn ACL"',
+    EventCategory.SHOOTING: '("shooting" OR "gunman" OR "active shooter")',
+    EventCategory.ASSASSINATION_ATTEMPT: '("assassination attempt" OR "attempted assassination")',
+    EventCategory.EVACUATION: '("evacuation" OR "evacuated" OR "evacuate")',
+    EventCategory.DEATH_INJURY: '("killed in" OR "wounded in" OR "fatally shot")',
+    EventCategory.RESIGNATION: '("resigned" OR "resignation" OR "stepping down")',
+    EventCategory.ARREST: '("arrested" OR "in custody" OR "detained by police")',
+    EventCategory.INDICTMENT: '("indicted" OR "indictment" OR "charged with")',
+    EventCategory.WAR_ESCALATION: '("airstrike" OR "missile strike" OR "invasion")',
+    EventCategory.CEASEFIRE: '("ceasefire" OR "truce" OR "peace deal")',
+    EventCategory.ELECTION_RESULT: '("wins election" OR "election results" OR "concedes")',
+    EventCategory.COURT_RULING: '("supreme court ruling" OR "court ruled" OR "verdict")',
+    EventCategory.MACRO_DATA_SURPRISE: '("jobs report" OR "rate cut" OR "rate hike" OR "Fed decision")',
+    EventCategory.SPORTS_INJURY: '("out for season" OR "ruled out" OR "torn ACL")',
 }
 
 # Used by the startup canary. Plain, broad, won't be rejected — the
 # point is to verify GDELT is reachable and returning JSON before we
-# launch into the 13-category sweep.
+# launch into the 13-category sweep. Single phrase (no OR), so no
+# outer parens needed.
 _CANARY_QUERY = '"climate change"'
+
+
+# ============================================================
+# Query syntax validation — fail-fast guard
+# ============================================================
+
+
+class GdeltQuerySyntaxError(ValueError):
+    """Raised when a query violates GDELT's documented syntax rules
+    that we can check locally without round-tripping the API.
+
+    Today the only checked rule is "OR'd terms must be surrounded by
+    ()" — the same rule that caused the 2026-04-26 v3.1 incident.
+    Add more rules here as we learn them from the wire.
+    """
+
+
+def _validate_query_syntax(query: str, *, label: str = "query") -> None:
+    """Local validation. Raises ``GdeltQuerySyntaxError`` on a
+    detectably-invalid query so module import / lane startup fails
+    instead of producing 'Queries containing OR'd terms must be
+    surrounded by ().' on every cycle.
+
+    Rule (today): if the query contains a top-level ` OR ` token
+    (case-sensitive, surrounded by spaces) and is NOT wrapped in
+    outer parens, it's invalid. Nested OR groups inside parens are
+    fine (and not validated further — GDELT itself will tell us if
+    they're malformed).
+    """
+    q = (query or "").strip()
+    if not q:
+        return
+    if " OR " not in q:
+        return  # Single term or AND-only — no parens needed.
+    # If the whole query is one bracketed group (`(...)`), assume
+    # it's correctly wrapped. We don't try to fully tokenise — that
+    # would re-implement GDELT's parser. Empirically GDELT accepts
+    # `(a OR b)` and `(a OR b) AND (c OR d)` etc.
+    if q.startswith("(") and q.endswith(")"):
+        return
+    # If the query contains AND-joined groups like `(a OR b) AND c`,
+    # it doesn't need outer parens around the whole thing — only
+    # around the OR groups. Accept any query whose every top-level
+    # OR appears inside a paren group.
+    if _every_or_is_inside_parens(q):
+        return
+    raise GdeltQuerySyntaxError(
+        f"GDELT {label} contains unwrapped OR — must be surrounded "
+        f"by parens. Got: {query!r}"
+    )
+
+
+def _every_or_is_inside_parens(q: str) -> bool:
+    """Walk the query left-to-right tracking paren depth. If any
+    ` OR ` token appears at depth 0, return False."""
+    depth = 0
+    i = 0
+    while i < len(q):
+        c = q[i]
+        if c == "(":
+            depth += 1
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            if depth < 0:
+                return False  # malformed parens
+            i += 1
+            continue
+        # Look for " OR " at this position.
+        if depth == 0 and q[i:i+4] == " OR ":
+            return False
+        i += 1
+    return depth == 0
+
+
+# Run validation at import time so a bad query in `_CATEGORY_QUERIES`
+# fails the import (and therefore the bot startup) instead of silently
+# 429ing every cycle in production.
+for _cat, _q in _CATEGORY_QUERIES.items():
+    _validate_query_syntax(_q, label=f"category {_cat.value}")
+_validate_query_syntax(_CANARY_QUERY, label="canary")
 
 # Default categories whitelist for the initial-stability phase. The
 # connector ships covering 13 categories but only RUNS the ones in
@@ -232,6 +323,12 @@ _QUERY_INVALID_PHRASES: tuple[str, ...] = (
     "Query is invalid",
     "Format is invalid",
     "must contain at least",  # GDELT's "query too broad" message
+    # GDELT's "wrap OR'd terms in parens" message — caught the
+    # 2026-04-26 v3.1 incident where every category query lacked
+    # outer parens. The validator below now refuses to start the
+    # bot with such a query, but we still classify the message in
+    # case a future query slips past the validator.
+    "Queries containing OR",
 )
 
 # Long backoff (30 min) for query_invalid — re-running the same broken
@@ -400,6 +497,16 @@ async def _fetch_gdelt(
         rate limiter.
     """
     url = _build_url(query, max_records=max_records, timespan=timespan)
+    # DEBUG-level query preview — helps a future operator see exactly
+    # what we sent if a category starts failing in a way that doesn't
+    # match a known phrase. raw vs encoded vs full URL covers the
+    # three places a syntax bug can hide.
+    logger.debug(
+        "[gdelt] fetch raw_query={!r} encoded_query={!r} url={}",
+        query,
+        url.split("query=", 1)[1].split("&", 1)[0] if "query=" in url else "",
+        url,
+    )
     timeout = httpx.Timeout(connect=timeout_connect, read=timeout_read,
                             write=10.0, pool=10.0)
 

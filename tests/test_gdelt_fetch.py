@@ -19,12 +19,17 @@ import pytest
 from core.feeds.gdelt import (
     _BACKOFF_BASE_SECONDS,
     _BACKOFF_CAP_SECONDS,
+    _CANARY_QUERY,
+    _CATEGORY_QUERIES,
     _PENALTY_HOLD_SECONDS,
     _PENALTY_WIDEN_TO_SECONDS,
+    GdeltQuerySyntaxError,
     GdeltRateLimiter,
+    _build_url,
     _CategoryState,
     _classify_failure,
     _fetch_gdelt,
+    _validate_query_syntax,
 )
 
 
@@ -659,3 +664,116 @@ def test_resolve_enabled_categories_dedupes():
     f = GdeltFeed()
     out = f._resolve_enabled_categories(["shooting", "shooting", "ceasefire"])
     assert out == [EventCategory.SHOOTING, EventCategory.CEASEFIRE]
+
+
+# ============================================================
+# Query syntax — parens around OR'd terms
+# ============================================================
+
+
+def test_validator_accepts_single_phrase_query():
+    """No OR -> no parens needed. The canary fits this shape."""
+    _validate_query_syntax('"climate change"', label="canary")
+
+
+def test_validator_accepts_query_wrapped_in_parens():
+    _validate_query_syntax('("a" OR "b" OR "c")', label="x")
+
+
+def test_validator_accepts_and_of_paren_groups():
+    """`(a OR b) AND (c OR d)` is valid GDELT syntax — every OR is
+    inside a paren group."""
+    _validate_query_syntax('("a" OR "b") AND ("c" OR "d")', label="x")
+
+
+def test_validator_accepts_paren_group_anded_with_bare_term():
+    _validate_query_syntax('("a" OR "b") AND "c"', label="x")
+
+
+def test_validator_rejects_unwrapped_or():
+    """The exact bug from the v3.1 incident — bare ` OR ` at depth 0."""
+    with pytest.raises(GdeltQuerySyntaxError):
+        _validate_query_syntax('"a" OR "b"', label="x")
+
+
+def test_validator_rejects_unwrapped_or_with_more_terms():
+    with pytest.raises(GdeltQuerySyntaxError):
+        _validate_query_syntax('"shooting" OR "gunman" OR "active shooter"', label="x")
+
+
+def test_validator_rejects_partial_paren_with_outside_or():
+    """`(a OR b) OR c` has the outer OR outside any paren group."""
+    with pytest.raises(GdeltQuerySyntaxError):
+        _validate_query_syntax('("a" OR "b") OR "c"', label="x")
+
+
+def test_validator_rejects_malformed_parens():
+    """Unbalanced parens shouldn't accidentally be accepted."""
+    with pytest.raises(GdeltQuerySyntaxError):
+        _validate_query_syntax(') OR (', label="x")
+
+
+def test_every_active_category_query_passes_validator():
+    """Contract test: any future query added to `_CATEGORY_QUERIES`
+    must pass the validator. Catches the regression where the
+    pre-v3.1 queries were missing parens."""
+    for cat, q in _CATEGORY_QUERIES.items():
+        _validate_query_syntax(q, label=f"category {cat.value}")
+        # And the query must include the parens marker on any OR.
+        if " OR " in q:
+            assert q.startswith("(") and q.endswith(")"), (
+                f"category {cat.value} query lacks outer parens: {q!r}"
+            )
+
+
+def test_canary_query_passes_validator():
+    _validate_query_syntax(_CANARY_QUERY, label="canary")
+
+
+# ============================================================
+# URL encoding preserves parens
+# ============================================================
+
+
+def test_build_url_encodes_parens_safely():
+    """urlencode should percent-encode `(` and `)` but the parens
+    must round-trip (GDELT must see them in the decoded query). We
+    don't assert on the literal escaping (`(` may be `%28` or `(`
+    depending on quote_via) — we assert that the encoded query is
+    NOT empty and contains either form."""
+    url = _build_url('("a" OR "b")', max_records=10, timespan="1h")
+    assert "query=" in url
+    encoded = url.split("query=", 1)[1].split("&", 1)[0]
+    # Either literal '(' or its percent-encoding.
+    assert "(" in encoded or "%28" in encoded
+    assert ")" in encoded or "%29" in encoded
+    # And `OR` must survive.
+    assert "OR" in encoded
+
+
+def test_build_url_for_each_active_category_contains_parens_marker():
+    for cat, q in _CATEGORY_QUERIES.items():
+        if " OR " not in q:
+            continue
+        url = _build_url(q, max_records=10, timespan="1h")
+        encoded = url.split("query=", 1)[1].split("&", 1)[0]
+        assert "(" in encoded or "%28" in encoded, (
+            f"category {cat.value} URL is missing opening paren"
+        )
+        assert ")" in encoded or "%29" in encoded, (
+            f"category {cat.value} URL is missing closing paren"
+        )
+
+
+# ============================================================
+# Classifier picks up the new GDELT validation phrase
+# ============================================================
+
+
+def test_classify_or_terms_must_be_surrounded_is_query_invalid():
+    """The exact GDELT message that revealed v3.1 was incomplete."""
+    assert _classify_failure(
+        status_code=200, content_type="text/html; charset=utf-8",
+        body_excerpt="Queries containing OR'd terms must be surrounded by ().",
+        exception_class="",
+    ) == "query_invalid"
