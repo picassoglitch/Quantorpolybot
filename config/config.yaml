@@ -88,7 +88,18 @@ scalping:
   trailing_drawdown_pct: 3
   max_age_hours: 24
   min_resolve_days: 2
-  max_resolve_days: 14
+  # Bumped 14 -> 60 (April 2026 supply audit).
+  # Pre-change: 4 markets in the 2-14d window, all extreme tail
+  # (mid <0.05 or >0.95). Post-change: 15 markets in 2-60d window
+  # after the price-band filter is applied. Polymarket's liquid
+  # universe is currently dominated by 30-90d resolution markets
+  # (268/295 = 91%); the 14-day cap excluded 281/295 liquid
+  # markets including the only ones in the scalpable price band.
+  # Pair this with `price_band` below — neither change alone
+  # unblocks the lane (price-band on 14d empties the pool;
+  # 60d window without price-band exposes lottery tails in the
+  # 30-90d bulk).
+  max_resolve_days: 60
   # Legacy gate. Kept for back-compat with older configs / dashboards
   # that still read it. The scalping lane now reads `evidence_tiers`
   # below (which falls back to this value when `strong_min_sources`
@@ -100,6 +111,24 @@ scalping:
   monitor_seconds: 30
   candidate_pool_size: 300
   scan_cap: 40
+  # ---- Price-band pre-filter ----
+  # Drop markets at extreme tails BEFORE scoring. min_edge is an
+  # absolute threshold (default 0.04); on a market at mid=0.001 even
+  # a 30x mispricing call buys only 0.03 of edge — mathematically
+  # below 0.04 absolute. Polymarket's liquid universe is dominated
+  # by near-settlement "Will X happen by date Y?" lottery markets
+  # clustered at mid<0.01 and mid>=0.99, where the absolute-edge
+  # gate is unreachable and the LLM (correctly) refuses to claim
+  # large mispricings. The April 2026 supply audit found 100% of
+  # strong-tier scoring events were landing on these tails. This
+  # filter drops them at the pre-filter so scoring budget goes to
+  # markets where 4c absolute edge is mathematically reachable.
+  # Tune narrower (e.g. 0.10–0.90) if the lane consistently grabs
+  # marginal-edge entries near the boundaries; widen if the
+  # kept-bucket is starved.
+  price_band:
+    min_mid: 0.05
+    max_mid: 0.95
   # ---- Step #2: evidence tiering ----
   # The scalping lane previously skipped any market without at least
   # `min_evidence_sources` distinct news sources, which on the April

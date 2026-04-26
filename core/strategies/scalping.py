@@ -196,16 +196,52 @@ class ScalpingLane:
         # returned 37/40 mismatches and the lane never reached Ollama —
         # that was the April 2026 idle-scalping bug. The 300-wide pull
         # with in-window filter exposes the liquid-short-dated subset.
+        #
+        # Price-band gate: `min_edge` is an absolute threshold (default
+        # 0.04). On a market trading at mid=0.001, even calling it 30×
+        # mispriced only buys 0.03 of edge — mathematically below 0.04
+        # absolute. The April 2026 post-publisher-fix soak showed
+        # 100% of strong-tier scoring events landed at mid<0.01 or
+        # mid>=0.99 (lottery-tail "Will X happen by April 30?"
+        # markets), and the lane entered zero trades despite the LLM
+        # producing structured, honest output. Filtering to a
+        # scalpable mid range here drops those tail markets at the
+        # pre-filter, before any LLM call. Default 0.05–0.95;
+        # operator-tunable via `scalping.price_band` in config.yaml.
         candidate_pool = int(cfg.get("candidate_pool_size", 300))
         scan_cap = int(cfg.get("scan_cap", 40))
+        band_cfg = cfg.get("price_band") or {}
+        band_min_mid = safe_float(band_cfg.get("min_mid", 0.05))
+        band_max_mid = safe_float(band_cfg.get("max_mid", 0.95))
         pool = await market_cache.list_active(limit=candidate_pool)
         windowed: list[Any] = []
+        band_kept = 0
+        band_dropped_low_mid = 0
+        band_dropped_high_mid = 0
         for m in pool:
             d = days_until_resolve(m.close_time)
-            if d is not None and min_days <= d <= max_days:
+            if d is None or not (min_days <= d <= max_days):
+                continue
+            mid = m.mid
+            if mid < band_min_mid:
+                band_dropped_low_mid += 1
+                continue
+            if mid > band_max_mid:
+                band_dropped_high_mid += 1
+                continue
+            band_kept += 1
+            if len(windowed) < scan_cap:
                 windowed.append(m)
-            if len(windowed) >= scan_cap:
-                break
+            # Don't break the loop here — keep counting drops past
+            # scan_cap so the log line below reflects the true
+            # filter signal across the in-window pool, not just the
+            # prefix we'd have looked at otherwise.
+        if band_kept or band_dropped_low_mid or band_dropped_high_mid:
+            logger.info(
+                "[scalping] price_band_filter: kept={} "
+                "dropped_low_mid={} dropped_high_mid={}",
+                band_kept, band_dropped_low_mid, band_dropped_high_mid,
+            )
         candidates = windowed
         blocked = concentration_blocked()
         scan_ts = now_ts()
