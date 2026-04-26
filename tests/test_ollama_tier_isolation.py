@@ -1,16 +1,24 @@
-"""Per-tier isolation regression tests.
+"""Per-tier isolation regression tests (executor edition).
 
-Step #1 of the April 2026 unblocking work split the single global Ollama
-semaphore into per-tier semaphores. The headline regression is: a stuck
-deep call must not prevent fast-tier scoring from running. Without the
-fix, `OllamaClient.fast_score()` would queue behind a 60s deep call on
-the shared 2-slot semaphore and burn its own 45s ``wait_for`` budget
-before getting a slot — even though the GPU itself wasn't busy with
-fast-tier work.
+Step #1 of the April 2026 unblocking work tried per-tier asyncio
+semaphores. The 10-minute soak failed: even a single in-flight deep
+call still affected event-loop responsiveness, because async httpx
+has subtle sync hot spots (DNS, JSON parsing, pool locks) and
+cancellation propagation through the pool can stall on Windows.
 
-These tests bypass the network entirely by monkey-patching the shared
-httpx client's ``post`` to return either a synthetic OK response or a
-controllable delay, so they're safe to run anywhere (no real Ollama).
+Step #1.5 moved every Ollama call onto a per-tier
+``ThreadPoolExecutor`` with a sync ``httpx.Client``. The asyncio loop
+now only awaits a ``concurrent.futures.Future`` — no sockets, no DNS,
+no pool state on the loop thread.
+
+These tests verify the new architecture:
+
+  1. Loop responsiveness: while a worker thread is blocked, the
+     asyncio loop can still execute hundreds of small tasks promptly.
+  2. Tier isolation: fast and deep workers run in separate executors
+     so a deep stall doesn't even occupy a thread the fast tier needs.
+  3. Hard timeout: ``asyncio.wait_for`` returns within the configured
+     budget regardless of whether the worker thread is still running.
 """
 
 from __future__ import annotations
@@ -21,160 +29,164 @@ import time
 import pytest
 
 from core.signals import ollama_client as ollama_mod
+from core.signals import ollama_executor
 from core.signals.ollama_client import OllamaClient
 
 
 @pytest.fixture(autouse=True)
 def _reset_module_state():
-    # Per-tier sems and queue counters are module/class level — reset
-    # between tests so saturation/cooldown state doesn't bleed.
-    ollama_mod._reset_tier_semaphores()
+    # Per-tier executors and circuit state are module-level — drop
+    # them between tests so prior state doesn't bleed.
+    ollama_executor.reset_for_tests()
+    ollama_mod.reset_circuits_for_tests()
     OllamaClient.pending_fast = 0
     OllamaClient.pending_deep = 0
     OllamaClient.pending_validator = 0
     yield
-    ollama_mod._reset_tier_semaphores()
+    ollama_executor.reset_for_tests()
+    ollama_mod.reset_circuits_for_tests()
     OllamaClient.pending_fast = 0
     OllamaClient.pending_deep = 0
     OllamaClient.pending_validator = 0
 
 
-def _ok_response_factory(payload: str = '{"implied_prob":0.5,"confidence":0.5,"reasoning":"x"}'):
-    class _Resp:
-        def raise_for_status(self) -> None:
-            return None
+def _patch_do_post(monkeypatch, handler):
+    """Replace the worker-thread HTTP call with ``handler``. The
+    handler runs on a real worker thread (not the asyncio loop), which
+    is exactly the property we want to verify."""
+    def fake_do_post(tier, request_id, url, body, sync_timeout):
+        # Re-use the executor's tracking + result type.
+        from core.signals.ollama_executor import (
+            GenerateResult, _inflight, _inflight_lock,
+        )
+        started = time.perf_counter()
+        with _inflight_lock:
+            _inflight[tier][request_id] = started
+        try:
+            return handler(tier, request_id, url, body, sync_timeout)
+        finally:
+            with _inflight_lock:
+                _inflight[tier].pop(request_id, None)
 
-        def json(self) -> dict:
-            return {"response": payload}
-
-    return _Resp()
-
-
-class _StubClient:
-    """Drop-in for the shared httpx client. ``post`` invokes a
-    user-supplied async callable so each test can simulate a slow deep
-    call, an instant fast call, or whatever it needs."""
-
-    def __init__(self, post_handler):
-        self._handler = post_handler
-        self.is_closed = False
-
-    async def post(self, url, json=None):  # noqa: A002 - matches httpx API
-        return await self._handler(url, json)
+    monkeypatch.setattr(ollama_executor, "_do_post", fake_do_post)
 
 
-# --- 1. The headline regression: stuck deep doesn't starve fast --------
+# --- 1. The headline regression: loop stays responsive while a deep
+#       worker is blocked ------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_stuck_deep_call_does_not_starve_fast(monkeypatch):
-    """A deep call hangs for longer than the fast tier's wait_for
-    budget. The fast call must still complete promptly because it has
-    its own per-tier semaphore — not the previous shared one."""
-    deep_started = asyncio.Event()
-    release_deep = asyncio.Event()
+async def test_loop_remains_responsive_during_blocking_deep_call(monkeypatch):
+    """While a deep worker thread is sleeping on a synchronous call,
+    the asyncio loop must continue to execute small tasks promptly.
+    This is the headline regression — async httpx blocked the loop
+    via internal sync hot spots even with per-tier semaphores."""
+    import threading
 
-    async def post_handler(url, body):
-        if body.get("model", "") and body["options"].get("num_predict", 300) >= 1:
-            # Fast-vs-deep is determined by which model name was sent.
-            # Inspect the request to decide what to do.
-            pass
-        # Distinguish deep from fast by a flag we plant on the body
-        # via the prompt prefix below.
-        if body.get("prompt", "").startswith("DEEP:"):
+    deep_started = threading.Event()
+    release_deep = threading.Event()
+
+    def handler(tier, request_id, url, body, sync_timeout):
+        from core.signals.ollama_executor import GenerateResult
+        if tier == "deep":
             deep_started.set()
-            await release_deep.wait()
-            return _ok_response_factory()
-        # Fast path: respond instantly.
-        return _ok_response_factory()
+            # Block the worker thread for up to 5s. The loop should
+            # keep running fine because this is on a thread, not the
+            # loop itself.
+            for _ in range(50):
+                if release_deep.is_set():
+                    break
+                time.sleep(0.1)
+        return GenerateResult(
+            data={"response": '{"implied_prob":0.5,"confidence":0.5}'},
+            error="", latency_ms=0.0, request_id=request_id, tier=tier,
+        )
 
-    stub = _StubClient(post_handler)
+    _patch_do_post(monkeypatch, handler)
 
-    async def fake_get_client():
-        return stub
-
-    monkeypatch.setattr(ollama_mod, "_get_shared_client", fake_get_client)
-
-    client = OllamaClient()
-    # Tighten the fast timeout so the test doesn't have to actually
-    # wait the production budget; we just need fast < deep.
+    # Tighter wait_for so the test cleans up fast.
     monkeypatch.setattr(
         OllamaClient, "_timeout_for",
-        lambda self, t: 0.5 if t == "fast" else 30.0,
-    )
-
-    deep_task = asyncio.create_task(client.deep_score("DEEP: stall me"))
-    # Make sure the deep call has acquired its slot before we kick off fast.
-    await asyncio.wait_for(deep_started.wait(), timeout=2.0)
-
-    # If the fast tier shared a slot with deep, this would either time
-    # out (fast budget burned waiting for deep) or queue indefinitely.
-    t0 = time.perf_counter()
-    fast_result = await client.fast_score("FAST: hello")
-    elapsed = time.perf_counter() - t0
-    assert fast_result is not None, "fast call must succeed while deep is stuck"
-    # Fast call should have completed in well under the deep stall.
-    # Allow generous slack for CI scheduling but assert it didn't wait
-    # behind the deep slot.
-    assert elapsed < 0.5, f"fast call took {elapsed:.2f}s — likely starved by deep slot"
-
-    # Cleanup: release the deep call so the task drains.
-    release_deep.set()
-    await asyncio.wait_for(deep_task, timeout=5.0)
-
-
-# --- 2. Per-tier cooldown isolation ------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_deep_cooldown_does_not_block_fast(monkeypatch):
-    """Five deep failures trip the deep cooldown. A subsequent fast call
-    must still attempt the network — only deep is paused, not the whole
-    client."""
-    fast_calls: list[int] = []
-    deep_calls: list[int] = []
-
-    async def post_handler(url, body):
-        prompt = body.get("prompt", "")
-        if prompt.startswith("DEEP:"):
-            deep_calls.append(1)
-            raise RuntimeError("simulated deep failure")
-        fast_calls.append(1)
-        return _ok_response_factory()
-
-    stub = _StubClient(post_handler)
-
-    async def fake_get_client():
-        return stub
-
-    monkeypatch.setattr(ollama_mod, "_get_shared_client", fake_get_client)
-    monkeypatch.setattr(
-        OllamaClient, "_timeout_for", lambda self, t: 5.0,
+        lambda self, t: 8.0 if t == "deep" else 1.0,
     )
 
     client = OllamaClient()
-    # Drive deep into cooldown via 5 consecutive failures.
-    for _ in range(5):
-        await client.deep_score("DEEP: fail")
-    assert client._in_cooldown("deep") is True
-    # A 6th deep call short-circuits inside the cooldown without hitting
-    # the network — verify by counting deep_calls before/after.
-    deep_count_before = len(deep_calls)
-    await client.deep_score("DEEP: fail again")
-    assert len(deep_calls) == deep_count_before, "deep cooldown must skip the network"
+    deep_task = asyncio.create_task(client.deep_score("hold-the-thread"))
+    # Wait for the worker thread to enter handler() — poll the
+    # threading.Event from the loop without blocking.
+    for _ in range(40):
+        if deep_started.is_set():
+            break
+        await asyncio.sleep(0.05)
+    assert deep_started.is_set(), "deep worker did not start"
 
-    # Critically: fast tier is unaffected.
-    assert client._in_cooldown("fast") is False
-    fast_count_before = len(fast_calls)
-    result = await client.fast_score("FAST: hello")
-    assert result is not None
-    assert len(fast_calls) == fast_count_before + 1
+    # Now fire 200 tiny coroutines and time how long they take to
+    # complete. Old async-httpx pattern would stall these whenever the
+    # loop was processing the deep call's pending I/O.
+    t0 = time.perf_counter()
+    await asyncio.gather(*(asyncio.sleep(0) for _ in range(200)))
+    elapsed = time.perf_counter() - t0
+    # Generous bound — even a slow CI box shouldn't take more than 100ms
+    # to drain 200 no-op tasks. With the old async-httpx pattern under
+    # load this could blow past 1s.
+    assert elapsed < 0.5, (
+        f"loop processed 200 no-op tasks in {elapsed*1000:.0f}ms "
+        "while a deep worker was blocked — expected <500ms"
+    )
+
+    # And firing a fast call should also complete promptly because the
+    # fast tier has its own executor + httpx.Client.
+    t0 = time.perf_counter()
+    fast_result = await client.fast_score("hi")
+    fast_elapsed = time.perf_counter() - t0
+    assert fast_result is not None
+    assert fast_elapsed < 1.0, (
+        f"fast call took {fast_elapsed:.2f}s while deep worker was blocked"
+    )
+
+    # Cleanup.
+    release_deep.set()
+    await asyncio.wait_for(deep_task, timeout=10.0)
 
 
-# --- 3. fast_queue_saturated reflects the configured threshold ---------
+# --- 2. Hard timeout fires cleanly even when the worker is stuck -------
 
 
-def test_fast_queue_saturated_threshold(monkeypatch):
+@pytest.mark.asyncio
+async def test_hard_timeout_returns_none_quickly(monkeypatch):
+    """If the worker thread doesn't return within the wait_for budget,
+    the asyncio side must give up promptly and yield None — even if
+    the worker is still stuck."""
+    def handler(tier, request_id, url, body, sync_timeout):
+        # Sleep WAY past the wait_for budget. The asyncio side should
+        # not wait for us.
+        time.sleep(2.0)
+        from core.signals.ollama_executor import GenerateResult
+        return GenerateResult(
+            data={"response": "{}"}, error="", latency_ms=0.0,
+            request_id=request_id, tier=tier,
+        )
+
+    _patch_do_post(monkeypatch, handler)
+    monkeypatch.setattr(
+        OllamaClient, "_timeout_for", lambda self, t: 0.2,
+    )
+
+    client = OllamaClient()
+    t0 = time.perf_counter()
+    result = await client.fast_score("hello")
+    elapsed = time.perf_counter() - t0
+    assert result is None
+    # Generous slack: must be well under the 2s worker-thread sleep.
+    assert elapsed < 1.0, (
+        f"wait_for took {elapsed:.2f}s — should fire near the 0.2s budget"
+    )
+
+
+# --- 3. fast_queue_saturated reflects either source (executor or class) -
+
+
+def test_fast_queue_saturated_threshold_with_class_attr(monkeypatch):
     from core.utils.config import get_config
 
     cfg = get_config()
@@ -184,15 +196,34 @@ def test_fast_queue_saturated_threshold(monkeypatch):
     assert OllamaClient.fast_queue_saturated() is False
     OllamaClient.pending_fast = 4
     assert OllamaClient.fast_queue_saturated() is True
-    OllamaClient.pending_fast = 100
+
+
+def test_fast_queue_saturated_reads_executor_in_flight(monkeypatch):
+    """In production the executor's in-flight tracker is what matters.
+    Even with the class counter at 0, a real running call must show
+    up in the saturation calculation."""
+    from core.utils.config import get_config
+
+    cfg = get_config()
+    cfg._data.setdefault("ollama", {})["queue_depth_alert"] = 2
+
+    # Simulate two in-flight fast calls without using the real handler.
+    from core.signals.ollama_executor import _inflight, _inflight_lock
+    with _inflight_lock:
+        _inflight["fast"]["req-a"] = time.perf_counter()
+        _inflight["fast"]["req-b"] = time.perf_counter()
+
+    OllamaClient.pending_fast = 0  # class counter empty
     assert OllamaClient.fast_queue_saturated() is True
 
+    with _inflight_lock:
+        _inflight["fast"].clear()
 
-# --- 4. Per-tier semaphore size honors config --------------------------
+
+# --- 4. Per-tier ThreadPoolExecutor honors config ----------------------
 
 
-@pytest.mark.asyncio
-async def test_per_tier_semaphores_use_config(monkeypatch):
+def test_per_tier_executor_uses_config(monkeypatch):
     from core.utils.config import get_config
 
     cfg = get_config()
@@ -201,23 +232,17 @@ async def test_per_tier_semaphores_use_config(monkeypatch):
     ollama["deep_max_concurrent"] = 1
     ollama["validator_max_concurrent"] = 2
     cfg._data["ollama"] = ollama
-    ollama_mod._reset_tier_semaphores()
+    ollama_executor.reset_for_tests()
 
-    fast_sem = await ollama_mod._get_tier_semaphore("fast")
-    deep_sem = await ollama_mod._get_tier_semaphore("deep")
-    val_sem = await ollama_mod._get_tier_semaphore("validator")
-    # asyncio.Semaphore exposes _value (initial = configured cap before
-    # any acquires); use it for assertion since there's no public getter.
-    assert fast_sem._value == 3
-    assert deep_sem._value == 1
-    assert val_sem._value == 2
+    fast_ex = ollama_executor._get_executor("fast")
+    deep_ex = ollama_executor._get_executor("deep")
+    val_ex = ollama_executor._get_executor("validator")
+    assert fast_ex._max_workers == 3
+    assert deep_ex._max_workers == 1
+    assert val_ex._max_workers == 2
 
 
-@pytest.mark.asyncio
-async def test_legacy_max_concurrent_calls_used_for_fast_default():
-    """Old configs that only set max_concurrent_calls=N must still
-    cap the fast tier at N (back-compat for users who haven't migrated
-    config.yaml yet)."""
+def test_legacy_max_concurrent_calls_used_for_fast_default():
     from core.utils.config import get_config
 
     cfg = get_config()
@@ -225,7 +250,28 @@ async def test_legacy_max_concurrent_calls_used_for_fast_default():
     ollama.pop("fast_max_concurrent", None)
     ollama["max_concurrent_calls"] = 5
     cfg._data["ollama"] = ollama
-    ollama_mod._reset_tier_semaphores()
+    ollama_executor.reset_for_tests()
 
-    fast_sem = await ollama_mod._get_tier_semaphore("fast")
-    assert fast_sem._value == 5
+    fast_ex = ollama_executor._get_executor("fast")
+    assert fast_ex._max_workers == 5
+
+
+# --- 5. Watchdog stuck-task detection ----------------------------------
+
+
+def test_in_flight_snapshot_marks_old_calls_as_stuck():
+    from core.signals.ollama_executor import _inflight, _inflight_lock
+    now = time.perf_counter()
+    with _inflight_lock:
+        _inflight["deep"]["old-1"] = now - 60.0  # 60s old
+        _inflight["fast"]["new-1"] = now - 1.0   # 1s old
+
+    snap = ollama_executor.in_flight_snapshot(stuck_age_seconds=30.0)
+    stuck_ids = [rid for _, rid, _ in snap.stuck]
+    assert "old-1" in stuck_ids
+    assert "new-1" not in stuck_ids
+    assert snap.per_tier_in_flight.get("deep", 0) >= 1
+
+    with _inflight_lock:
+        _inflight["deep"].clear()
+        _inflight["fast"].clear()

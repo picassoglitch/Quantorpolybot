@@ -340,9 +340,18 @@ ollama:
   fast_model: qwen2.5:7b-instruct-q4_K_M
   deep_model: qwen2.5:7b-instruct-q4_K_M
   validator_model: llama3:8b-instruct-q8_0
-  fast_timeout_seconds: 45
-  deep_timeout_seconds: 60
-  validator_timeout_seconds: 60
+  # Hard wall-clock budgets enforced by ``asyncio.wait_for`` on the
+  # loop side. These are intentionally tight: every Ollama call now
+  # runs on a per-tier ThreadPoolExecutor (see core.signals.ollama_executor),
+  # so the worker thread is bounded by these timeouts and the loop
+  # never blocks on the network. April 2026 soak: 45/60/60 was too
+  # generous and let stalled deep calls eat 60+ seconds while the
+  # watchdog accumulated `event_loop_blocked` warnings. 10/20/20 is
+  # tighter than the GPU's natural latency for a healthy call but lets
+  # the heuristic fallback take over fast on a degraded server.
+  fast_timeout_seconds: 10
+  deep_timeout_seconds: 20
+  validator_timeout_seconds: 20
   fast_temperature: 0.2
   deep_temperature: 0.3
   validator_temperature: 0.1
@@ -358,6 +367,15 @@ ollama:
   max_concurrent_calls: 2
   validator_high_stakes_usd: 10
   validator_max_prob_drift: 0.15
+  # Process-wide circuit breaker. After ``circuit_open_threshold``
+  # consecutive failures on a tier, that tier is short-circuited for
+  # ``circuit_open_seconds``. One half-open probe is admitted after
+  # the window; success closes the circuit, failure re-opens it for
+  # 2× the cooldown. Logs print "circuit OPENED|HALF-OPEN|CLOSED" on
+  # each state transition so operator triage sees the breaker
+  # explicitly.
+  circuit_open_threshold: 5
+  circuit_open_seconds: 60
 scheduler:
   market_refresh_cron: '*/5 * * * *'
   health_check_cron: '*/1 * * * *'
