@@ -47,18 +47,21 @@ from core.utils.helpers import now_ts, safe_float
 
 @dataclass
 class CandidateDecision:
-    """One side of the accept/reject union. Lane checks `accepted`.
+    """One side of the accept/reject/observed union. Lane checks
+    `accepted` for the trade decision; `observed` for the
+    "noticed-but-not-traded" path.
 
-    `audit_row_id` is the rowid of the persisted scan_skips-style
-    row in `event_market_candidates`; the lane updates it with the
-    `shadow_position_id` once the position opens (so the audit
-    trail is complete).
+    `audit_row_id` is the rowid of the persisted row in
+    `event_market_candidates`; the lane updates it with the
+    `shadow_position_id` once the position opens (so the audit trail
+    is complete). For observed candidates, no position is opened and
+    the row's status remains "observed".
     """
 
     accepted: bool
     event_id: str
     market_id: str
-    side: str               # "BUY" / "SELL" (= BUY NO) / "" if rejected
+    side: str               # "BUY" / "SELL" (= BUY NO) / "" if rejected/observed
     true_prob: float
     confidence: float
     edge: float
@@ -66,6 +69,11 @@ class CandidateDecision:
     reason: str
     impact_snapshot: dict[str, Any] = field(default_factory=dict)
     audit_row_id: int = 0
+    # PR #7: marks an "observed" decision — the scout noticed the
+    # event but no polarity rule fired. Persisted with
+    # status="observed", no shadow trade opened. Lane uses this to
+    # increment the observed-counter in scan summaries.
+    observed: bool = False
 
 
 async def evaluate(
@@ -168,7 +176,47 @@ async def evaluate(
                 f"already exist for this event_id (cap {event_max_positions})"
             )
 
-    # ---- Direction must be non-zero ----
+    # ---- Observed-mode short-circuit (PR #7) ----
+    # When the impact scorer flagged this as a watchlist signal
+    # (high severity + strong match but no polarity rule), persist
+    # as status="observed" — visible in audit, NOT traded. We do
+    # this AFTER the safety/cooldown checks (a bad-corroboration
+    # event still records as "rejected") but BEFORE the
+    # direction/edge gates (which would otherwise reject it as
+    # polarity_unknown).
+    if reject is None and impact.observed:
+        row_id = await _persist(
+            event_id=event.event_id,
+            market_id=market.market_id,
+            status="observed",
+            reject_reason="",
+            side="",
+            true_prob=impact.true_prob,
+            confidence=impact.confidence,
+            edge=0.0,
+            market_mid=mid,
+            impact_snapshot=audit_snapshot,
+        )
+        return CandidateDecision(
+            accepted=False,
+            event_id=event.event_id,
+            market_id=market.market_id,
+            side="",
+            true_prob=impact.true_prob,
+            confidence=impact.confidence,
+            edge=0.0,
+            market_mid=mid,
+            reason=(
+                f"observed: severity={event.severity:.2f} "
+                f"match_score={match.score:.2f} "
+                f"polarity_unknown=true (no trade)"
+            ),
+            impact_snapshot=audit_snapshot,
+            audit_row_id=row_id,
+            observed=True,
+        )
+
+    # ---- Direction must be non-zero (after observed-mode check) ----
     if reject is None and impact.direction == 0:
         reject = f"polarity_unknown: {impact.polarity_reasoning}"
 
@@ -266,7 +314,14 @@ def _check_rules(
         return (
             f"spread {spread_cents:.1f}c outside (0, {max_spread_cents:.1f}c]"
         )
-    if impact.confidence < min_confidence:
+    # Skip the impact.confidence gate when direction == 0. Both
+    # downstream paths (observed-mode and polarity_unknown) handle
+    # the no-direction case explicitly with their own logic, and
+    # observed-mode is BELOW this gate by design (~0.20). Without
+    # this, observed candidates would always reject as
+    # "impact confidence 0.20 < 0.40" and never reach the observed
+    # branch.
+    if impact.direction != 0 and impact.confidence < min_confidence:
         return (
             f"impact confidence {impact.confidence:.2f} < "
             f"{min_confidence:.2f}"

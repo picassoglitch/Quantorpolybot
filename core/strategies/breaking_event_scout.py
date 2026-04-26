@@ -158,6 +158,9 @@ class BreakingEventScoutLane:
         counts = {
             "signals": 0, "events_seen": 0, "events_new": 0,
             "mapped": 0, "accepted": 0, "rejected": 0,
+            # PR #7: scout noticed the event but no polarity rule
+            # fired. Persisted with status="observed", no trade.
+            "observed": 0,
             "no_mapping": 0,
         }
 
@@ -210,9 +213,11 @@ class BreakingEventScoutLane:
                 continue
             counts["mapped"] += len(matches)
             for match in matches:
-                accepted = await self._evaluate_and_maybe_open(event, match)
-                if accepted:
+                outcome = await self._evaluate_and_maybe_open(event, match)
+                if outcome == "accepted":
                     counts["accepted"] += 1
+                elif outcome == "observed":
+                    counts["observed"] += 1
                 else:
                     counts["rejected"] += 1
 
@@ -224,9 +229,10 @@ class BreakingEventScoutLane:
         if counts["events_new"] > 0:
             logger.info(
                 "[scout] scan signals={} events_new={} mapped={} "
-                "accepted={} rejected={} no_mapping={}",
+                "accepted={} observed={} rejected={} no_mapping={}",
                 counts["signals"], counts["events_new"], counts["mapped"],
-                counts["accepted"], counts["rejected"], counts["no_mapping"],
+                counts["accepted"], counts["observed"], counts["rejected"],
+                counts["no_mapping"],
             )
         return counts
 
@@ -295,10 +301,18 @@ class BreakingEventScoutLane:
 
     async def _evaluate_and_maybe_open(
         self, event: Event, match: scout_mapper.MarketMatch,
-    ) -> bool:
+    ) -> str:
         """Score impact, run the safety gate, and open a SHADOW
-        position if accepted. Returns True iff a position was
-        opened."""
+        position if accepted.
+
+        Returns one of:
+          - ``"accepted"`` — SHADOW position was opened
+          - ``"observed"`` — scout noticed the event but no polarity
+            rule fired; row persisted with ``status="observed"``,
+            no trade
+          - ``"rejected"`` — failed a safety/edge/confidence gate;
+            row persisted with ``status="rejected"`` and a reason
+        """
         # Get a fresh price snapshot — the cached market.mid may be
         # stale by minutes; for breaking-news entries that's the
         # difference between hitting an exit-able price and not.
@@ -315,6 +329,17 @@ class BreakingEventScoutLane:
         decision = await scout_candidate.evaluate(
             event, match, impact, market_mid=market_mid, cfg=_cfg(),
         )
+        if decision.observed:
+            # Visible-not-traded path. Logged at INFO so the operator
+            # sees that the scout DID notice the event (separate from
+            # rejected, which means a safety rule blocked it).
+            logger.info(
+                "[scout] OBSERVED event={} market={} sev={:.2f} "
+                "match_score={:.2f} (no polarity rule, no trade)",
+                event.event_id, match.market.market_id,
+                event.severity, match.score,
+            )
+            return "observed"
         if not decision.accepted:
             logger.info(
                 "[scout] reject event={} market={} side={} edge={:.3f} "
@@ -322,7 +347,7 @@ class BreakingEventScoutLane:
                 event.event_id, match.market.market_id,
                 decision.side or "-", decision.edge, decision.reason,
             )
-            return False
+            return "rejected"
 
         # Lane state checks before reserving capital.
         state = await allocator.get_state(LANE)
@@ -332,7 +357,7 @@ class BreakingEventScoutLane:
                 "skipping open",
                 event.event_id, match.market.market_id,
             )
-            return False
+            return "rejected"
 
         size_usd = await _position_size(decision.confidence, _cfg())
         approved = await allocator.reserve(LANE, size_usd)
@@ -342,7 +367,7 @@ class BreakingEventScoutLane:
                 "(wanted={:.2f})",
                 event.event_id, match.market.market_id, size_usd,
             )
-            return False
+            return "rejected"
 
         if snap is None or snap.mid <= 0:
             await allocator.release(LANE, approved, 0.0)
@@ -350,7 +375,7 @@ class BreakingEventScoutLane:
                 "[scout] event={} market={} no live snapshot at open time",
                 event.event_id, match.market.market_id,
             )
-            return False
+            return "rejected"
 
         pos_id = await shadow.open_position(
             strategy=LANE,
@@ -387,7 +412,7 @@ class BreakingEventScoutLane:
                 "[scout] open_position returned None for event={} market={}",
                 event.event_id, match.market.market_id,
             )
-            return False
+            return "rejected"
 
         await scout_candidate.attach_position(decision.audit_row_id, pos_id)
         logger.info(
@@ -396,7 +421,7 @@ class BreakingEventScoutLane:
             event.event_id, match.market.market_id, decision.side,
             approved, decision.edge, decision.confidence,
         )
-        return True
+        return "accepted"
 
 
 async def _position_size(confidence: float, cfg: dict[str, Any]) -> float:
