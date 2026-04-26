@@ -84,6 +84,10 @@ scalping:
   max_age_hours: 24
   min_resolve_days: 2
   max_resolve_days: 14
+  # Legacy gate. Kept for back-compat with older configs / dashboards
+  # that still read it. The scalping lane now reads `evidence_tiers`
+  # below (which falls back to this value when `strong_min_sources`
+  # is omitted).
   min_evidence_sources: 2
   liquidity_exit_spread_cents: 5
   rescore_seconds: 300
@@ -91,6 +95,47 @@ scalping:
   monitor_seconds: 30
   candidate_pool_size: 300
   scan_cap: 40
+  # ---- Step #2: evidence tiering ----
+  # The scalping lane previously skipped any market without at least
+  # `min_evidence_sources` distinct news sources, which on the April
+  # 2026 soak meant `skip=[evidence=40]` for every scan — the lane
+  # never traded. Tiering lets us still act on lower-corroboration
+  # markets at reduced size and tighter gates.
+  evidence_tiers:
+    # ---- Strong tier: full LLM scoring at full size. ----
+    strong_min_sources: 2
+    # Items older than this don't count toward the strong-tier source
+    # bar (price has digested them). Default 6h matches half the lane's
+    # max_age_hours: 24 — fresh enough that the LLM call is worth it.
+    fresh_within_seconds: 21600  # 6h
+    # ---- Weak tier: heuristic-only scoring at reduced size. ----
+    # 1 distinct source qualifies. Tagged watchlist=true on persistence
+    # so recurring weak hits are visible for source-list promotion.
+    weak_min_sources: 1
+    weak_size_multiplier: 0.5
+    # Heuristic confidence is capped at 0.70 (see core.strategies.heuristic).
+    # Use the lane's existing min_confidence (0.60) as the floor — the
+    # weak tier should NOT have a looser gate just because it's smaller.
+    weak_min_confidence: 0.60
+    # ---- Microstructure tier: orderbook/tick proxy, smallest size. ----
+    # Set `microstructure_enabled: false` to disable this tier entirely
+    # — the lane will then skip no-evidence markets with a clear reason
+    # ("none: 0 source(s) ...") instead of attempting a microstructure
+    # read.
+    microstructure_enabled: true
+    microstructure_size_multiplier: 0.3
+    # The microstructure scorer caps confidence at 0.55 internally; this
+    # is the lane-side gate. 0.50 means microstructure entries fire only
+    # when the proxy strength is high enough to push confidence past
+    # the 0.40 floor toward the cap — a clean drift on a healthy book.
+    microstructure_min_confidence: 0.50
+    # Lane-side strength gate (in addition to the module's confidence
+    # cap). 0.55 means we want a clearly directional drift on at least
+    # a moderately liquid book; weaker than that gets logged as a skip
+    # instead of opened.
+    microstructure_min_strength: 0.55
+    microstructure_window_seconds: 600  # 10 min lookback for ticks
+    microstructure_min_ticks: 6         # need at least 6 ticks in window
 event_sniping:
   enabled: true
   feed_freshness_minutes: 5
@@ -397,7 +442,15 @@ scheduler:
   learning_cron: 30 3 * * *
   source_trust_cron: 10 4 * * *
   lane_rebalance_cron: 20 4 * * *
+  # Step #2: nightly TTL purge of the scan_skips table. The lane writes
+  # one row per skipped market per scan; over a week of scans that's
+  # ~40 candidates × 60 scans/h × 24h × 7d = ~400k rows if we never
+  # purge. The 7d TTL keeps roughly a week of history for the dashboard
+  # and tuner without unbounded growth.
+  scan_skips_purge_cron: 40 4 * * *
   backtest_window_days: 30
+scan_skips:
+  ttl_days: 7
 optimization:
   enabled: true
   improvement_threshold: 0.05

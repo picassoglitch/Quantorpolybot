@@ -4,6 +4,20 @@ Catch small mispricings on liquid markets, exit fast. Liquidity is the
 core filter here — no illiquid markets, no wide spreads, no stale
 prices. Exits trigger on PnL thresholds, spread widening, position age,
 or a conviction flip from the Ollama re-score.
+
+Persistence note (forward-pointer for the planned Signal Quality +
+Pattern Discovery layer):
+
+  Every skip writes a `scan_skips` row whose `score_snapshot` JSON
+  bundles three blocks: `market` (mid, spread, token, liquidity at
+  scan time), `evidence` (sources, feed_item ids, count), and
+  branch-specific `extras` (score, edge, vol_24h, microstructure
+  components, etc.). Combined with `scan_skips.scan_ts` and the
+  `price_ticks` index on `(market_id, ts)`, a future analytics job
+  can compute "price-after-1m/5m/15m/1h" for every signal the lane
+  saw, partitioned by source / tier / reject reason — without any
+  schema migration. See ROADMAP item: Signal Quality + Pattern
+  Discovery.
 """
 
 from __future__ import annotations
@@ -18,9 +32,16 @@ from core.execution.risk_manager import concentration_blocked
 from core.markets import cache as market_cache
 from core.signals.ollama_client import OllamaClient
 from core.strategies import scoring
+from core.strategies.evidence_tier import (
+    EvidenceTier,
+    classify_evidence,
+    record_skip,
+)
+from core.strategies.heuristic import score as heuristic_score
+from core.strategies.microstructure import score_microstructure
 from core.utils.config import get_config
 from core.utils.db import fetch_all, fetch_one
-from core.utils.helpers import now_ts, safe_float
+from core.utils.helpers import clamp, now_ts, safe_float
 from core.utils.prices import (
     current_price,
     days_until_resolve,
@@ -114,7 +135,34 @@ class ScalpingLane:
         min_conf = safe_float(cfg.get("min_confidence", 0.60))
         min_days = safe_float(cfg.get("min_resolve_days", 2))
         max_days = safe_float(cfg.get("max_resolve_days", 14))
-        min_evidence = int(cfg.get("min_evidence_sources", 2))
+        # Legacy gate is now derived from `evidence_tiers.strong_min_sources`.
+        # Reading both keeps existing configs working until they re-tune.
+        tiers_cfg = cfg.get("evidence_tiers") or {}
+        strong_min_sources = int(
+            tiers_cfg.get("strong_min_sources", cfg.get("min_evidence_sources", 2))
+        )
+        weak_min_sources = int(tiers_cfg.get("weak_min_sources", 1))
+        fresh_within_seconds = safe_float(
+            tiers_cfg.get("fresh_within_seconds", 6 * 3600.0)
+        )
+        weak_size_mult = safe_float(tiers_cfg.get("weak_size_multiplier", 0.5))
+        micro_size_mult = safe_float(
+            tiers_cfg.get("microstructure_size_multiplier", 0.3)
+        )
+        weak_min_conf = safe_float(
+            tiers_cfg.get("weak_min_confidence", min_conf)
+        )
+        micro_min_conf = safe_float(
+            tiers_cfg.get("microstructure_min_confidence", 0.50)
+        )
+        micro_min_strength = safe_float(
+            tiers_cfg.get("microstructure_min_strength", 0.55)
+        )
+        micro_window_seconds = safe_float(
+            tiers_cfg.get("microstructure_window_seconds", 600.0)
+        )
+        micro_min_ticks = int(tiers_cfg.get("microstructure_min_ticks", 6))
+        micro_enabled = bool(tiers_cfg.get("microstructure_enabled", True))
 
         # Liquid markets first. liquidity is our pre-proxy for volume; we
         # confirm 24h volume via gamma before entry.
@@ -139,26 +187,110 @@ class ScalpingLane:
                 break
         candidates = windowed
         blocked = concentration_blocked()
+        scan_ts = now_ts()
         # Funnel counters: each bucket is "skipped because of X" so we
         # can tell whether the lane is idle because nothing qualified,
         # Ollama rejected everything, or something else. Without this,
         # a silent lane is indistinguishable from a dead lane.
         total = len(candidates)
         skipped: dict[str, int] = {}
+        # Per-tier counters (added in Step #2): how many markets
+        # actually traded under each evidence tier this scan?
+        tier_counts: dict[str, int] = {t.value: 0 for t in EvidenceTier}
         scored_n = 0
         ollama_n = 0      # of scored, came from a real Ollama response
         heuristic_n = 0   # of scored, came from the keyword fallback
+        micro_n = 0       # of scored, came from microstructure proxy
         low_conf = 0
         low_edge = 0
         entered = 0
+
+        def _market_snapshot(market: Any) -> dict[str, Any]:
+            """Forward-pointer for the planned Signal Quality + Pattern
+            Discovery layer: the pattern engine needs the market's
+            mid/spread/token at the moment of the decision, plus
+            something to JOIN against `price_ticks` for "price after
+            N minutes" calculations. Captured per-skip in
+            `score_snapshot` so we don't need a schema change later.
+            Cheap — six floats and one string per row.
+            """
+            return {
+                "mid": market.mid,
+                "best_bid": market.best_bid,
+                "best_ask": market.best_ask,
+                "spread_cents": (market.best_ask - market.best_bid) * 100.0,
+                "liquidity": market.liquidity,
+                "yes_token": market.yes_token() or "",
+            }
+
+        def _evidence_snapshot(items: list[dict[str, Any]]) -> dict[str, Any]:
+            """Companion to `_market_snapshot`. Persists the source
+            attribution and feed_item ids so the pattern engine can
+            answer "which sources contributed to this skip?" without
+            having to reconstruct the lane's evidence query against a
+            possibly-rotated feed_items table.
+            """
+            sources = sorted({
+                str(e.get("source")) for e in items if e.get("source")
+            })
+            evidence_ids = [
+                int(e["id"]) for e in items if e.get("id") is not None
+            ]
+            return {
+                "sources": sources,
+                "evidence_ids": evidence_ids,
+                "item_count": len(items),
+            }
+
+        async def _persist_skip(
+            market: Any,
+            tier_attempted: str,
+            reject_reason: str,
+            evidence_tier: str,
+            *,
+            watchlist: bool = False,
+            extras: dict[str, Any] | None = None,
+            evidence_items: list[dict[str, Any]] | None = None,
+        ) -> None:
+            """Local closure — captures scan_ts so every skip in one
+            scan shares the same scan_ts (handy for grouping later).
+
+            Builds the score_snapshot payload from three sources:
+            `_market_snapshot(market)` (always), `_evidence_snapshot`
+            (when we have it), and `extras` (per-branch score data).
+            Branch-specific extras win on key collision so callers can
+            override e.g. `mid` if they want a more precise value.
+            """
+            payload: dict[str, Any] = {"market": _market_snapshot(market)}
+            if evidence_items is not None:
+                payload["evidence"] = _evidence_snapshot(evidence_items)
+            if extras:
+                payload.update(extras)
+            await record_skip(
+                lane=LANE,
+                market_id=market.market_id,
+                tier_attempted=tier_attempted,
+                reject_reason=reject_reason,
+                evidence_tier=evidence_tier,
+                watchlist=watchlist,
+                score_snapshot=payload,
+                scan_ts=scan_ts,
+            )
+
         for market in candidates:
             if open_count + entered >= max_concurrent:
                 break
             if market.market_id in blocked:
                 skipped["concentration"] = skipped.get("concentration", 0) + 1
+                await _persist_skip(
+                    market, "pregate", "concentration", "n/a",
+                )
                 continue
             if await shadow.count_open_for_market_in_lane(market.market_id, LANE) > 0:
                 skipped["already_open"] = skipped.get("already_open", 0) + 1
+                await _persist_skip(
+                    market, "pregate", "already_open", "n/a",
+                )
                 continue
             # Date window already enforced in the pool pre-filter above;
             # no need to re-check here.
@@ -166,57 +298,217 @@ class ScalpingLane:
             spread_cents = (market.best_ask - market.best_bid) * 100.0
             if spread_cents <= 0 or spread_cents > max_spread_cents:
                 skipped["spread"] = skipped.get("spread", 0) + 1
+                await _persist_skip(
+                    market, "pregate",
+                    f"spread {spread_cents:.1f}c > {max_spread_cents:.1f}c",
+                    "n/a",
+                )
                 continue
-            # Evidence requirement.
+
+            # ---- Evidence tiering (Step #2) ----
             evidence = await _recent_evidence_for(market.market_id, limit=5)
-            sources = {e.get("source") for e in evidence if e.get("source")}
-            if len(sources) < min_evidence:
-                skipped["evidence"] = skipped.get("evidence", 0) + 1
-                continue
+            classification = classify_evidence(
+                evidence,
+                strong_min_sources=strong_min_sources,
+                weak_min_sources=weak_min_sources,
+                fresh_within_seconds=fresh_within_seconds,
+                now=scan_ts,
+            )
+
             # Volume check (fresh from gamma; avoid scalp on volume traps).
+            # Pulled forward of scoring so MICRO tier — which needs vol_24h
+            # for its liquidity component — gets it for free.
             vol = await volume_24h(market.market_id)
             if vol < min_volume:
                 skipped["volume"] = skipped.get("volume", 0) + 1
+                await _persist_skip(
+                    market, "pregate",
+                    f"volume {vol:.0f} < {min_volume:.0f}",
+                    classification.tier.value,
+                    evidence_items=evidence,
+                    extras={"vol_24h": vol},
+                )
                 continue
-            # Score via Ollama (or keyword heuristic on saturation /
-            # timeout — see core.strategies.scoring.score_with_fallback).
-            # Lanes used to call ``scoring.score`` here, which returned
-            # ``None`` whenever the fast queue was saturated or Ollama
-            # stalled; that produced "scan total=40 ... scored=0" for
-            # entire 10-minute windows. ``score_with_fallback`` always
-            # returns a Score so a degraded GPU never zeros out entries.
+
+            # Per-tier scoring + sizing. Each branch produces:
+            #   - `score`: a scoring.Score (or scoring.Score-shaped object)
+            #   - `tier_label`: which tier we attempted, recorded in skips
+            #   - `size_mult`: multiplier on the allocator-suggested size
+            #   - `tier_min_conf`: the confidence floor for THIS tier
+            #   - `watchlist_flag`: whether this market should be tagged
+            #     watchlist=true on persistence
             text = "\n".join(
                 f"{e.get('title','')}: {(e.get('summary') or '')[:200]}"
                 for e in evidence[:3]
             )
-            # Scalping entry uses the fast tier: ~40 candidates per cycle
-            # means we can't afford the 15-30s deep model here.
-            score = await scoring.score_with_fallback(
-                market, text, client=self._client, tier="fast",
-            )
-            scored_n += 1
-            if score.source == "ollama":
-                ollama_n += 1
-            else:
+            tier_label: str
+            size_mult: float
+            tier_min_conf: float
+            watchlist_flag = False
+
+            if classification.tier is EvidenceTier.STRONG:
+                # Existing path: fast-tier LLM with heuristic fallback.
+                # Scalping can't afford the 15-30s deep model on ~40
+                # candidates per cycle.
+                score = await scoring.score_with_fallback(
+                    market, text, client=self._client, tier="fast",
+                )
+                scored_n += 1
+                if score.source == "ollama":
+                    ollama_n += 1
+                else:
+                    heuristic_n += 1
+                tier_label = EvidenceTier.STRONG.value
+                size_mult = 1.0
+                tier_min_conf = min_conf
+            elif classification.tier is EvidenceTier.WEAK:
+                # Heuristic-only — no LLM call. The keyword scorer is
+                # capped at 0.70 confidence so even a strong directional
+                # headline can't size up the way an LLM call would. We
+                # also tag this as watchlist so the operator can spot
+                # recurring weak signals worth promoting.
+                h = heuristic_score(text, market)
+                score = scoring.Score(
+                    true_prob=h.implied_prob,
+                    confidence=h.confidence,
+                    reasoning=h.reasoning,
+                    source="heuristic",
+                )
+                scored_n += 1
                 heuristic_n += 1
-            # Heuristic confidence is capped at 0.70 by design (see
-            # core.strategies.heuristic) — the existing min_conf gate
-            # already filters thin keyword signals, so fallback Scores
-            # only enter on a clear directional headline.
-            if score.confidence < min_conf:
+                tier_label = EvidenceTier.WEAK.value
+                size_mult = weak_size_mult
+                tier_min_conf = weak_min_conf
+                watchlist_flag = True
+            elif classification.tier is EvidenceTier.NONE and micro_enabled:
+                # Microstructure proxy: liquidity + drift + spread + vol.
+                # The module returns None when ticks are too thin —
+                # treated as "no signal" and skipped with a clear reason.
+                micro = await score_microstructure(
+                    market,
+                    max_spread_cents=max_spread_cents,
+                    min_volume_24h=min_volume,
+                    vol_24h=vol,
+                    window_seconds=micro_window_seconds,
+                    min_ticks=micro_min_ticks,
+                )
+                if micro is None or micro.direction == 0 or micro.strength < micro_min_strength:
+                    skipped["no_evidence_no_microstructure"] = (
+                        skipped.get("no_evidence_no_microstructure", 0) + 1
+                    )
+                    extras: dict[str, Any] = {"vol_24h": vol}
+                    if micro is not None:
+                        extras.update({
+                            "microstructure_strength": micro.strength,
+                            "microstructure_direction": micro.direction,
+                            "components": micro.components,
+                        })
+                    await _persist_skip(
+                        market,
+                        EvidenceTier.MICRO.value,
+                        (
+                            "microstructure: insufficient signal"
+                            if micro is not None
+                            else "microstructure: no ticks / unusable book"
+                        ),
+                        EvidenceTier.NONE.value,
+                        watchlist=False,
+                        evidence_items=evidence,
+                        extras=extras,
+                    )
+                    continue
+                score = scoring.Score(
+                    true_prob=micro.implied_prob,
+                    confidence=micro.confidence,
+                    reasoning=micro.reasoning,
+                    source="microstructure",
+                )
+                scored_n += 1
+                micro_n += 1
+                tier_label = EvidenceTier.MICRO.value
+                size_mult = micro_size_mult
+                tier_min_conf = micro_min_conf
+            else:
+                # Tier=NONE and microstructure disabled (or already
+                # reached the explicit no-signal branch above for
+                # tier=NONE). Skip with the classifier's own reasoning.
+                skipped["no_evidence"] = skipped.get("no_evidence", 0) + 1
+                await _persist_skip(
+                    market,
+                    "n/a",
+                    classification.reasoning,
+                    classification.tier.value,
+                    evidence_items=evidence,
+                    extras={"vol_24h": vol},
+                )
+                continue
+
+            # ---- Confidence + edge gates (per-tier-aware) ----
+            if score.confidence < tier_min_conf:
                 low_conf += 1
+                # Watchlist flag also propagates here: a weak-tier
+                # market that fell short on confidence is still useful
+                # to know about for tuning.
+                await _persist_skip(
+                    market,
+                    tier_label,
+                    f"confidence {score.confidence:.2f} < {tier_min_conf:.2f}",
+                    classification.tier.value,
+                    watchlist=watchlist_flag,
+                    evidence_items=evidence,
+                    extras={
+                        "true_prob": score.true_prob,
+                        "confidence": score.confidence,
+                        "source": score.source,
+                        "vol_24h": vol,
+                    },
+                )
                 continue
             edge = score.true_prob - market.mid
             if abs(edge) < min_edge:
                 low_edge += 1
+                await _persist_skip(
+                    market,
+                    tier_label,
+                    f"edge {abs(edge):.3f} < {min_edge:.3f}",
+                    classification.tier.value,
+                    watchlist=watchlist_flag,
+                    evidence_items=evidence,
+                    extras={
+                        "true_prob": score.true_prob,
+                        "confidence": score.confidence,
+                        "source": score.source,
+                        "edge": edge,
+                        "vol_24h": vol,
+                    },
+                )
                 continue
             side = "BUY" if edge > 0 else "SELL"
 
-            # Capital reservation + dynamic cap.
-            wanted = await _position_size(score.confidence)
+            # Capital reservation + dynamic cap. Tier multiplier reduces
+            # the requested size for non-strong tiers — the lane never
+            # sizes a microstructure-only entry the same as a corroborated
+            # news entry.
+            base_wanted = await _position_size(score.confidence)
+            wanted = clamp(base_wanted * size_mult, 0.0, base_wanted)
             approved = await allocator.reserve(LANE, wanted)
             if approved is None:
                 skipped["budget"] = skipped.get("budget", 0) + 1
+                await _persist_skip(
+                    market,
+                    tier_label,
+                    f"budget rejected wanted={wanted:.2f}",
+                    classification.tier.value,
+                    watchlist=watchlist_flag,
+                    evidence_items=evidence,
+                    extras={
+                        "true_prob": score.true_prob,
+                        "confidence": score.confidence,
+                        "source": score.source,
+                        "wanted": wanted,
+                        "vol_24h": vol,
+                    },
+                )
                 continue
 
             # Fresh price snapshot at entry.
@@ -225,6 +517,12 @@ class ScalpingLane:
                 await allocator.release(LANE, approved, 0.0)
                 continue
 
+            # `evidence` may be empty for the MICRO tier; rebuild the
+            # source set defensively so the snapshot is valid in all
+            # branches.
+            sources = sorted({
+                str(e.get("source")) for e in evidence if e.get("source")
+            })
             pos_id = await shadow.open_position(
                 strategy=LANE,
                 market=market,
@@ -234,14 +532,20 @@ class ScalpingLane:
                 true_prob=score.true_prob,
                 confidence=score.confidence,
                 entry_reason=(
-                    f"scalp: edge={edge:+.3f} conf={score.confidence:.2f} "
-                    f"spread={spread_cents:.1f}c vol={vol:.0f}"
+                    f"scalp[{tier_label}]: edge={edge:+.3f} "
+                    f"conf={score.confidence:.2f} spread={spread_cents:.1f}c "
+                    f"vol={vol:.0f} src={score.source} "
+                    f"size_mult={size_mult:.2f}"
+                    + (" watchlist" if watchlist_flag else "")
                 ),
                 evidence_ids=[int(e["id"]) for e in evidence if e.get("id")],
                 evidence_snapshot={
                     "reasoning": score.reasoning,
                     "evidence_count": len(evidence),
-                    "sources": sorted(sources),
+                    "sources": sources,
+                    "tier": tier_label,
+                    "watchlist": watchlist_flag,
+                    "size_mult": size_mult,
                 },
                 entry_latency_ms=0.0,
                 ollama_client=self._client,
@@ -252,19 +556,29 @@ class ScalpingLane:
                 await allocator.release(LANE, approved, 0.0)
                 continue
             entered += 1
+            tier_counts[classification.tier.value] = (
+                tier_counts.get(classification.tier.value, 0) + 1
+            )
         # Scan summary: always log so the operator can tell at a glance
         # whether the lane is actively looking (and where candidates
-        # die). `scored` is the count that reached Ollama — the pricey
+        # die). `scored` is the count that reached scoring — the pricey
         # bucket; the rest are cheap gate skips.
+        # Step #2 added the `tiers=` block so the operator can see the
+        # mix of strong/weak/microstructure entries at a glance.
         if total > 0:
             skip_summary = ", ".join(
                 f"{k}={v}" for k, v in sorted(skipped.items())
             ) or "none"
+            tier_summary = ", ".join(
+                f"{k}={v}" for k, v in sorted(tier_counts.items())
+                if v > 0
+            ) or "none"
             logger.info(
                 "[scalping] scan total={} skip=[{}] scored={} "
-                "(ollama={} heuristic={}) low_conf={} low_edge={} entered={}",
-                total, skip_summary, scored_n, ollama_n, heuristic_n,
-                low_conf, low_edge, entered,
+                "(ollama={} heuristic={} micro={}) "
+                "low_conf={} low_edge={} entered={} tiers=[{}]",
+                total, skip_summary, scored_n, ollama_n, heuristic_n, micro_n,
+                low_conf, low_edge, entered, tier_summary,
             )
         return entered
 

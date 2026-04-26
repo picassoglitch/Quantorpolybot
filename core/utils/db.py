@@ -311,6 +311,39 @@ SCHEMA = [
         last_computed_at REAL
     )
     """,
+    # Per-market scan reject log. One row per market that the lane
+    # *considered* but did not enter, written by the lane's scan loop.
+    # Lets the dashboard answer "why was market X rejected today" and
+    # gives the optimizer a reject-reason histogram to tune thresholds
+    # against. Aggregate scan summaries are still logged, but those
+    # don't tell you which specific market got dropped where.
+    #
+    # `tier_attempted` records the highest tier we tried (strong / weak
+    # / microstructure / none) so we can tell whether the reject hit
+    # before the LLM, after the LLM, or in the microstructure path.
+    # `evidence_tier` records the classifier's output regardless of
+    # whether we acted on it. `watchlist` is True when the market made
+    # it as far as scoring but was rejected at confidence/edge — those
+    # are the candidates worth surfacing later.
+    # `score_snapshot` is an optional JSON string with the score's
+    # internals (true_prob, confidence, components) for post-hoc tuning.
+    # Keep small — single-line JSON, not a transcript.
+    """
+    CREATE TABLE IF NOT EXISTS scan_skips (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_ts REAL,
+        lane TEXT,
+        market_id TEXT,
+        tier_attempted TEXT,
+        reject_reason TEXT,
+        evidence_tier TEXT,
+        watchlist INTEGER DEFAULT 0,
+        score_snapshot TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_scan_skips_ts ON scan_skips(scan_ts)",
+    "CREATE INDEX IF NOT EXISTS idx_scan_skips_market ON scan_skips(market_id, scan_ts)",
+    "CREATE INDEX IF NOT EXISTS idx_scan_skips_lane ON scan_skips(lane, scan_ts)",
 ]
 
 
