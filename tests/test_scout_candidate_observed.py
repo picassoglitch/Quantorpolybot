@@ -133,8 +133,15 @@ async def test_observed_safety_gates_still_apply(temp_db):
 @pytest.mark.asyncio
 async def test_observed_with_no_corroboration_rejects(temp_db):
     """Single non-primary source → reject (corroboration check
-    runs before observed-mode short-circuit)."""
+    runs before observed-mode short-circuit). Severity is forced
+    BELOW the v3 high-sev-solo threshold (0.80) so the override
+    doesn't accidentally rescue this. See test_scout_v3.py for
+    the override-rescue path."""
     one_source_event = _event(sources=["someblog"])
+    one_source_event = type(one_source_event)(
+        **{**one_source_event.__dict__, "severity": 0.65,
+           "source_count": 1},
+    )
     decision = await scout_candidate.evaluate(
         one_source_event, _match(_market()), _observed_impact(),
     )

@@ -243,9 +243,10 @@ def test_not_observed_when_match_score_below_threshold():
 
 def test_observed_thresholds_are_documented_constants():
     """Pin the constants in the test so a future loosening is
-    reviewed deliberately."""
-    assert _OBSERVED_MIN_SEVERITY == 0.60
-    assert _OBSERVED_MIN_MATCH_SCORE == 0.30
+    reviewed deliberately. Updated in v3 — was 0.60/0.30, now
+    0.50/0.25 to surface more events as observed candidates."""
+    assert _OBSERVED_MIN_SEVERITY == 0.50
+    assert _OBSERVED_MIN_MATCH_SCORE == 0.25
     assert _OBSERVED_CONFIDENCE == 0.20
 
 

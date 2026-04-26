@@ -124,19 +124,39 @@ class PredictItFeed:
     async def _poll(
         self, client: httpx.AsyncClient, threshold: float, auto_div: float
     ) -> tuple[int, int]:
-        # ---- I/O on main loop ----
+        # Per-cycle timing breakdown. Helps an operator confirm at a
+        # glance that the CPU-heavy filter is on the worker thread (the
+        # ``filter_thread_ms`` should be the largest stage WITHOUT
+        # showing up as event-loop lag in the watchdog log). Logged at
+        # the end of the cycle as a single summary line.
+        import time
+        t_cycle = time.perf_counter()
+
+        # ---- HTTP fetch ----
+        t_http = time.perf_counter()
         r = await client.get(API_URL)
         r.raise_for_status()
         payload = r.json()
+        http_ms = (time.perf_counter() - t_http) * 1000.0
         markets = payload.get("markets") or []
         if not markets:
+            logger.debug(
+                "[predictit] cycle empty payload http_ms={:.0f}", http_ms,
+            )
             return 0, 0
 
+        # ---- DB read (active polymarkets) ----
+        t_db_read = time.perf_counter()
         poly_rows = await fetch_all(
             "SELECT market_id, question, best_bid, best_ask, last_price "
             "FROM markets WHERE active=1"
         )
+        db_read_ms = (time.perf_counter() - t_db_read) * 1000.0
         if not poly_rows:
+            logger.debug(
+                "[predictit] cycle no active polymarkets http_ms={:.0f} "
+                "db_read_ms={:.0f}", http_ms, db_read_ms,
+            )
             return 0, 0
         poly_index: list[tuple[str, str, float | None]] = [
             (str(row["market_id"]), row["question"] or "", _mid_from_row(row))
@@ -149,11 +169,14 @@ class PredictItFeed:
         # ignores it. ``_filter_predictit_markets_sync`` is intentionally
         # synchronous — it must NOT await anything (no DB, no network,
         # no asyncio primitives). See the module docstring for why.
+        t_thread = time.perf_counter()
         matches, rejected = await asyncio.to_thread(
             _filter_predictit_markets_sync, markets, poly_index,
         )
+        filter_thread_ms = (time.perf_counter() - t_thread) * 1000.0
 
         # ---- DB writes back on main loop ----
+        t_db_write = time.perf_counter()
         ts = now_ts()
         matched = 0
         signaled = 0
@@ -175,12 +198,29 @@ class PredictItFeed:
                     m.divergence, m.match_reason,
                 ):
                     signaled += 1
+        db_write_ms = (time.perf_counter() - t_db_write) * 1000.0
 
         if rejected:
             logger.info(
                 "[predictit] filtered {} contracts as non-matches (new stricter rules)",
                 rejected,
             )
+
+        # ---- Cycle summary timing ----
+        # Single line so the operator sees the ratio at a glance:
+        # filter_thread_ms is OFF the event loop (worker thread); the
+        # other stages are on the loop. If db_write_ms drifts up, that
+        # would correlate with WAL contention — separate fix area.
+        total_ms = (time.perf_counter() - t_cycle) * 1000.0
+        logger.info(
+            "[predictit] cycle total={:.0f}ms (http={:.0f} db_read={:.0f} "
+            "filter_thread={:.0f} db_write={:.0f}) markets={} contracts~{} "
+            "matched={} rejected={}",
+            total_ms, http_ms, db_read_ms, filter_thread_ms, db_write_ms,
+            len(markets), sum(len(m.get("contracts") or []) for m in markets
+                              if isinstance(m, dict)),
+            matched, rejected,
+        )
         return matched, signaled
 
     async def _emit_signal(

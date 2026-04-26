@@ -130,8 +130,20 @@ async def test_reject_when_event_too_old(temp_db):
 
 @pytest.mark.asyncio
 async def test_reject_when_insufficient_corroboration_and_no_primary(temp_db):
+    """Single-source non-primary event with severity BELOW the v3
+    high-sev-solo threshold (0.80) must still reject as insufficient
+    corroboration. Above-threshold severity now passes through with
+    a reduced size multiplier — see test_scout_v3.py for that path.
+    """
+    # Force severity 0.65 < 0.80 so the v3 high_sev_solo override
+    # does NOT kick in; corroboration check still rejects.
+    weak_event = _event()
+    weak_event = type(weak_event)(  # rebuild dataclass with lower severity
+        **{**weak_event.__dict__, "severity": 0.65,
+           "sources": ["someblog"], "source_count": 1},
+    )
     decision = await scout_candidate.evaluate(
-        _event(sources=["someblog"]), _match(_market()), _impact(),
+        weak_event, _match(_market()), _impact(),
     )
     assert decision.accepted is False
     assert "corroboration" in decision.reason

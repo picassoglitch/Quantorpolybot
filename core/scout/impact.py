@@ -1,4 +1,4 @@
-"""Heuristic impact scorer for the scout lane (PR #1, no LLM in path).
+"""Heuristic impact scorer for the scout lane.
 
 Given an Event + a mapped Market + the market's mid price snapshot,
 estimate the probability impact of the event:
@@ -75,8 +75,13 @@ _HEURISTIC_CONFIDENCE_CAP = 0.55
 # severity AND the (event, market) match score clear these floors,
 # the scorer returns a low-confidence ImpactScore with ``observed=True``
 # so the lane records a watchlist entry instead of silently rejecting.
-_OBSERVED_MIN_SEVERITY = 0.60
-_OBSERVED_MIN_MATCH_SCORE = 0.30
+#
+# v3 lowered both floors so more events surface as observed candidates
+# — the previous 0.60/0.30 was too strict against the corpus we're
+# actually seeing from GDELT. Lowering doesn't loosen safety; observed
+# candidates STILL don't trade (confidence stays below the trade gate).
+_OBSERVED_MIN_SEVERITY = 0.50
+_OBSERVED_MIN_MATCH_SCORE = 0.25
 _OBSERVED_CONFIDENCE = 0.20  # Below the 0.40 trade gate, above 0.0
 
 
@@ -92,6 +97,11 @@ class ImpactScore:
     ``observed`` (PR #7) marks an ImpactScore that the lane should
     persist for visibility but NOT trade on. Direction is 0 in this
     case; confidence is ~0.20 (below the trade gate by design).
+
+    ``polarity_source`` (v3) records how `direction` was determined:
+    "rules" / "llm" / "none". The candidate audit snapshot logs this
+    so the dashboard can distinguish rule-based from LLM-inferred
+    decisions for post-hoc analysis.
     """
 
     direction: int
@@ -101,6 +111,7 @@ class ImpactScore:
     polarity_reasoning: str
     components: dict[str, float]
     observed: bool = False         # PR #7: watchlist signal, no trade
+    polarity_source: str = "rules"  # v3: "rules" | "llm" | "none"
 
 
 # Per-category baseline nudge magnitudes (probability units). Conservative;
@@ -339,6 +350,9 @@ def score_impact(
     *,
     market_mid: float | None = None,
     confidence_cap: float = _HEURISTIC_CONFIDENCE_CAP,
+    direction_override: int | None = None,
+    polarity_source_override: str = "",
+    polarity_reason_override: str = "",
 ) -> ImpactScore:
     """Compute the heuristic ImpactScore for one (Event, Market) pair.
 
@@ -346,9 +360,15 @@ def score_impact(
     value when the lane has a fresher snapshot than the cached
     market record.
 
+    ``direction_override`` (v3): when supplied (e.g. by an LLM
+    polarity call), bypasses ``_infer_polarity`` and uses the given
+    direction. ``polarity_source_override`` should be set to "llm"
+    in that case so the audit snapshot records it. Used by
+    ``score_impact_async`` below — most callers leave this None.
+
     Three return shapes:
 
-      1. direction != 0 (polarity rule matched):
+      1. direction != 0 (polarity rule matched OR override supplied):
            Full ImpactScore with confidence in (0, cap].
            Lane evaluates against min_confidence + edge gates.
 
@@ -366,7 +386,16 @@ def score_impact(
     mid = market_mid if market_mid is not None else market.mid
     mid = clamp(mid, 0.01, 0.99)
 
-    direction, polarity_reason = _infer_polarity(event.category, market.question)
+    if direction_override is not None and direction_override != 0:
+        direction = direction_override
+        polarity_reason = (
+            polarity_reason_override
+            or f"direction_override (source={polarity_source_override or 'unknown'})"
+        )
+        polarity_source = polarity_source_override or "override"
+    else:
+        direction, polarity_reason = _infer_polarity(event.category, market.question)
+        polarity_source = "rules" if direction != 0 else "none"
     base_nudge = _CATEGORY_NUDGE.get(event.category, 0.0)
     # Effective nudge: shrink by severity × match score so weak
     # matches don't claim category-baseline edge.
@@ -383,6 +412,20 @@ def score_impact(
             event.severity >= _OBSERVED_MIN_SEVERITY
             and match.score >= _OBSERVED_MIN_MATCH_SCORE
         )
+        # DEBUG-level decision trace so an operator can SEE exactly
+        # why an event was promoted to observed-mode (or not). Only
+        # surfaces under LOGURU_LEVEL=DEBUG; INFO logs stay clean.
+        from loguru import logger as _logger
+        _logger.debug(
+            "[scout] observed_decision event={} cat={} severity={:.2f}"
+            "(>={:.2f}={}) match_score={:.2f}(>={:.2f}={}) -> observed={}",
+            event.event_id, event.category.value,
+            event.severity, _OBSERVED_MIN_SEVERITY,
+            event.severity >= _OBSERVED_MIN_SEVERITY,
+            match.score, _OBSERVED_MIN_MATCH_SCORE,
+            match.score >= _OBSERVED_MIN_MATCH_SCORE,
+            observed,
+        )
         watch_conf = _OBSERVED_CONFIDENCE if observed else 0.0
         return ImpactScore(
             direction=0,
@@ -398,6 +441,7 @@ def score_impact(
                 "market_mid": mid,
             },
             observed=observed,
+            polarity_source=polarity_source,
         )
 
     true_prob = clamp(mid + direction * effective_nudge, 0.01, 0.99)
@@ -422,4 +466,172 @@ def score_impact(
             "event_confidence": event.confidence,
         },
         observed=False,
+        polarity_source=polarity_source,
+    )
+
+
+# ============================================================
+# LLM polarity inference (v3) — async wrapper around score_impact
+# ============================================================
+
+
+# When the rule table can't resolve a direction AND the event is
+# severe enough to be worth the LLM cost, we ask the model. The
+# call is wrapped in a hard timeout; on failure / unparseable
+# response we fall through to the rule-based score (which then
+# routes to observed-mode if thresholds are met).
+_LLM_POLARITY_DEFAULT_TIMEOUT_SECONDS = 5.0
+_LLM_POLARITY_DEFAULT_SEVERITY_FLOOR = 0.70
+
+
+def _build_polarity_prompt(event: "Event", market: "Any", mid: float) -> str:
+    """Tight prompt asking ONLY for a direction. Kept short so the
+    fast tier can return in 1-3 seconds."""
+    sources = ", ".join((event.sources or [])[:5]) or "unknown"
+    return (
+        "You are scoring a breaking-news event against one Polymarket\n"
+        "prediction market. Decide whether the event makes the YES\n"
+        "outcome MORE LIKELY (BUY YES), LESS LIKELY (SELL YES = BUY NO),\n"
+        "or has NO clear effect on the YES probability.\n"
+        "\n"
+        f"EVENT:\n"
+        f"  title: {event.title[:200]}\n"
+        f"  category: {event.category.value}\n"
+        f"  severity: {event.severity:.2f}\n"
+        f"  sources: {sources}\n"
+        "\n"
+        f"MARKET:\n"
+        f"  question: {market.question[:200]}\n"
+        f"  current YES probability: {mid:.2f}\n"
+        "\n"
+        "Respond with JSON ONLY (no commentary, no markdown):\n"
+        '  {"direction": "buy" | "sell" | "unclear", '
+        '"reason": "<one short sentence>"}'
+    )
+
+
+def _parse_polarity_response(payload: dict | None) -> tuple[int, str]:
+    """Map the JSON response to (direction, reasoning). Tolerant of
+    common synonyms ("yes"/"bullish" → buy, "no"/"bearish" → sell)
+    so we don't reject correct answers on cosmetic differences."""
+    if not isinstance(payload, dict):
+        return 0, "llm: empty/unparseable response"
+    raw = payload.get("direction") or payload.get("polarity") or ""
+    reason = (payload.get("reason") or payload.get("reasoning") or "")[:200]
+    if not isinstance(raw, str):
+        return 0, f"llm: non-string direction={raw!r}"
+    d = raw.strip().lower()
+    if d in ("buy", "yes", "bullish", "positive", "+1", "buy_yes"):
+        return +1, f"llm: {d} ({reason})" if reason else f"llm: {d}"
+    if d in ("sell", "no", "bearish", "negative", "-1", "sell_yes", "buy_no"):
+        return -1, f"llm: {d} ({reason})" if reason else f"llm: {d}"
+    return 0, f"llm: unclear ({d!r}) {reason}".strip()
+
+
+async def _llm_infer_polarity(
+    ollama_client: "Any",
+    event: "Event",
+    market: "Any",
+    mid: float,
+    *,
+    timeout_seconds: float = _LLM_POLARITY_DEFAULT_TIMEOUT_SECONDS,
+) -> tuple[int, str]:
+    """Single-shot LLM polarity inference. Returns
+    ``(direction, reason)`` where direction ∈ {-1, 0, +1}.
+
+    Failures (timeout, exception, empty response, unparseable
+    direction) all return (0, reason). Caller treats 0 as "no LLM
+    signal" and falls through to the rule-based / observed-mode
+    path. NEVER raises.
+    """
+    import asyncio
+    if ollama_client is None:
+        return 0, "llm: no client configured"
+    prompt = _build_polarity_prompt(event, market, mid)
+    try:
+        result = await asyncio.wait_for(
+            ollama_client.fast_score(
+                prompt, tag=f"scout:polarity:{event.event_id}",
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        return 0, f"llm: timeout (>{timeout_seconds:.1f}s)"
+    except Exception as e:
+        return 0, f"llm: error {type(e).__name__}: {str(e)[:120]}"
+    return _parse_polarity_response(result)
+
+
+async def score_impact_async(
+    event: "Event",
+    match: "MarketMatch",
+    *,
+    market_mid: float | None = None,
+    confidence_cap: float = _HEURISTIC_CONFIDENCE_CAP,
+    ollama_client: "Any" = None,
+    llm_severity_floor: float = _LLM_POLARITY_DEFAULT_SEVERITY_FLOOR,
+    llm_timeout_seconds: float = _LLM_POLARITY_DEFAULT_TIMEOUT_SECONDS,
+    llm_enabled: bool = True,
+) -> ImpactScore:
+    """Async variant of ``score_impact`` that consults the LLM for
+    polarity ONLY when:
+
+      - ``llm_enabled`` is True (config opt-out)
+      - ``ollama_client`` was provided
+      - The rule-based ``_infer_polarity`` returned 0 (rules
+        couldn't resolve direction)
+      - ``event.severity >= llm_severity_floor`` (default 0.70 —
+        only worth the LLM cost on high-severity events)
+
+    On any LLM failure (timeout, exception, unclear response), falls
+    back to ``score_impact`` (which then routes to observed-mode if
+    severity + match thresholds are met). The LLM call NEVER raises
+    to the caller.
+    """
+    market = match.market
+    mid_value = market_mid if market_mid is not None else market.mid
+    mid_value = clamp(mid_value, 0.01, 0.99)
+
+    # Fast path: rules already produced a direction, OR the LLM is
+    # disabled / unavailable. Either way, score synchronously.
+    rule_dir, _ = _infer_polarity(event.category, market.question)
+    should_call_llm = (
+        llm_enabled
+        and ollama_client is not None
+        and rule_dir == 0
+        and event.severity >= llm_severity_floor
+    )
+    if not should_call_llm:
+        return score_impact(
+            event, match,
+            market_mid=mid_value, confidence_cap=confidence_cap,
+        )
+
+    # LLM polarity attempt. Failures fall through to score_impact
+    # without override → observed-mode if thresholds are met.
+    llm_dir, llm_reason = await _llm_infer_polarity(
+        ollama_client, event, market, mid_value,
+        timeout_seconds=llm_timeout_seconds,
+    )
+    from loguru import logger as _logger
+    _logger.debug(
+        "[scout] llm_polarity event={} cat={} severity={:.2f} -> "
+        "direction={} reason={!r}",
+        event.event_id, event.category.value, event.severity,
+        llm_dir, llm_reason,
+    )
+    if llm_dir == 0:
+        # LLM couldn't resolve. Fall through to score_impact —
+        # observed-mode handles the "noticed but can't price" case.
+        return score_impact(
+            event, match,
+            market_mid=mid_value, confidence_cap=confidence_cap,
+        )
+
+    return score_impact(
+        event, match,
+        market_mid=mid_value, confidence_cap=confidence_cap,
+        direction_override=llm_dir,
+        polarity_source_override="llm",
+        polarity_reason_override=llm_reason,
     )
