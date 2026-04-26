@@ -1,4 +1,4 @@
-"""Single entrypoint for Quantorpolybot.
+"""Single entrypoint for NexoPolyBot.
 
   python run.py
 
@@ -20,21 +20,32 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+import threading
 from contextlib import suppress
 
 import uvicorn
 from loguru import logger
 
+from core.execution import allocator
 from core.execution.monitor import OrderMonitor
-from core.execution.orders import OrderEngine
+from core.execution.risk_manager import ShadowRiskManager
 from core.feeds.manager import FeedManager
+from core.feeds.price_refresher import PriceRefresher
 from core.markets.discovery import MarketDiscovery
 from core.risk.rules import RiskEngine
 from core.scheduler.jobs import JobScheduler
+from core.signals.ollama_client import OllamaClient, aclose_shared_client
 from core.signals.pipeline import SignalPipeline
+from core.strategies.event_sniper import EventSniperLane
+from core.strategies.longshot import LongshotLane
+from core.strategies.microscalp import MicroscalpLane
+from core.strategies.resolution_day import ResolutionDayLane
+from core.strategies.scalping import ScalpingLane
 from core.utils.config import env, get_config, load_env
 from core.utils.db import init_db
 from core.utils.logging import audit, setup_logging
+from core.utils.sanity import run_startup_checks
+from core.utils.watchdog import Watchdog
 
 
 class App:
@@ -42,21 +53,49 @@ class App:
         self.feeds = FeedManager()
         self.discovery = MarketDiscovery()
         self.risk = RiskEngine()
-        self.orders = OrderEngine()
         self.monitor = OrderMonitor()
-        self.signals = SignalPipeline(self.orders, self.risk)
+        self.signals = SignalPipeline(self.risk)
         self.scheduler = JobScheduler(self.discovery)
+        self.shadow_risk = ShadowRiskManager()
+        self.scalping_lane = ScalpingLane()
+        self.event_lane = EventSniperLane()
+        self.longshot_lane = LongshotLane()
+        self.resolution_day_lane = ResolutionDayLane()
+        self.microscalp_lane = MicroscalpLane()
+        self.price_refresher = PriceRefresher()
+        # Watchdog needs a handle to poly_ws so it can force a reconnect
+        # when the CLOB socket goes silent for too long.
+        self.watchdog = Watchdog(poly_ws=self.feeds.poly_ws)
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self._uvicorn_server: uvicorn.Server | None = None
+        self._dashboard_thread: threading.Thread | None = None
+        self._dashboard_loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> None:
-        logger.info("=" * 60)
-        logger.info("Quantorpolybot starting (dry_run={}, live_trading_enabled={})",
-                    get_config().get("dry_run", default=True),
-                    get_config().get("live_trading_enabled", default=False))
-        logger.info("=" * 60)
+        from core.brand import print_startup_banner
+        print_startup_banner()
+        logger.info(
+            "NexoPolyBot starting (mode={})",
+            str(get_config().get("mode", default="shadow")).upper(),
+        )
         await init_db()
+
+        # Cheap reachability pings before heavy subsystem boot, so any
+        # misconfigured host/port shows up early in the log instead of
+        # being buried under retry spam from 10 different feed loops.
+        await run_startup_checks()
+
+        # Force Ollama to swap the deep-tier model into VRAM *before*
+        # any lane or the signals pipeline can dispatch a call. Without
+        # this, the first ~20s of boot see ConnectTimeouts because
+        # Ollama's HTTP listener briefly stalls while mmap'ing the
+        # 5 GB GGUF off disk on Windows. Non-blocking on failure —
+        # per-call retries still handle a degraded Ollama afterward.
+        try:
+            await OllamaClient().warmup()
+        except Exception as e:
+            logger.warning("[boot] Ollama warmup raised: {}", e)
 
         # Initial market discovery so we have token ids before WS subscribes.
         try:
@@ -67,9 +106,21 @@ class App:
 
         await self.feeds.start()
 
+        # Bootstrap the three-lane shadow capital before any lane scans.
+        await allocator.init_lane_capital()
+
         self._tasks.append(asyncio.create_task(self.discovery.run(), name="markets.discovery"))
+        self._tasks.append(asyncio.create_task(self.price_refresher.run(), name="feeds.price_refresher"))
         self._tasks.append(asyncio.create_task(self.signals.run(), name="signals.pipeline"))
         self._tasks.append(asyncio.create_task(self.monitor.run(), name="execution.monitor"))
+        # Shadow trading — three lanes + their risk manager.
+        self._tasks.append(asyncio.create_task(self.shadow_risk.run(), name="shadow.risk"))
+        self._tasks.append(asyncio.create_task(self.scalping_lane.run(), name="shadow.scalping"))
+        self._tasks.append(asyncio.create_task(self.event_lane.run(), name="shadow.event"))
+        self._tasks.append(asyncio.create_task(self.longshot_lane.run(), name="shadow.longshot"))
+        self._tasks.append(asyncio.create_task(self.resolution_day_lane.run(), name="shadow.resolution_day"))
+        self._tasks.append(asyncio.create_task(self.microscalp_lane.run(), name="shadow.microscalp"))
+        self._tasks.append(asyncio.create_task(self.watchdog.run(), name="utils.watchdog"))
 
         self.scheduler.start()
         await self._start_dashboard()
@@ -77,6 +128,15 @@ class App:
         logger.info("[boot] all subsystems running")
 
     async def _start_dashboard(self) -> None:
+        """Run uvicorn in its own daemon thread with a dedicated event
+        loop so the dashboard doesn't lag when the main loop is busy
+        handling WS reconnects, Ollama calls, or market discovery.
+
+        Dashboard handlers talk to SQLite via aiosqlite (WAL mode +
+        busy_timeout, see core/utils/db.py). No cross-loop asyncio
+        primitives cross the boundary — each loop opens its own
+        connections.
+        """
         from dashboard.app import create_app
 
         host = env("DASHBOARD_HOST", get_config().get("dashboard", "host", default="127.0.0.1"))
@@ -90,31 +150,59 @@ class App:
             lifespan="off",
         )
         self._uvicorn_server = uvicorn.Server(config)
-        self._tasks.append(
-            asyncio.create_task(self._uvicorn_server.serve(), name="dashboard")
+        ready = threading.Event()
+
+        def _run_dashboard_loop() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._dashboard_loop = loop
+            ready.set()
+            try:
+                loop.run_until_complete(self._uvicorn_server.serve())
+            except Exception as e:
+                logger.exception("[dashboard] thread error: {}", e)
+            finally:
+                with suppress(Exception):
+                    loop.close()
+
+        t = threading.Thread(
+            target=_run_dashboard_loop, name="dashboard", daemon=True,
         )
-        logger.info("[dashboard] http://{}:{}", host, port)
+        t.start()
+        # Wait briefly for the loop reference; prevents a race in
+        # shutdown() where we'd try to signal a not-yet-started server.
+        ready.wait(timeout=5.0)
+        self._dashboard_thread = t
+        logger.info("[dashboard] http://{}:{} (in dedicated thread)", host, port)
 
     async def shutdown(self) -> None:
-        logger.info("[shutdown] cancelling open orders...")
-        try:
-            await asyncio.wait_for(self.orders.cancel_all_open(), timeout=20)
-        except asyncio.TimeoutError:
-            logger.warning("[shutdown] cancel_all_open timed out")
-        except Exception as e:
-            logger.warning("[shutdown] cancel error: {}", e)
-
+        logger.info("[shutdown] stopping subsystems...")
         await self.feeds.stop()
         await self.signals.stop()
         await self.discovery.stop()
+        await self.price_refresher.stop()
         await self.monitor.stop()
+        await self.shadow_risk.stop()
+        await self.scalping_lane.stop()
+        await self.event_lane.stop()
+        await self.longshot_lane.stop()
+        await self.resolution_day_lane.stop()
+        await self.microscalp_lane.stop()
+        await self.watchdog.stop()
         await self.scheduler.shutdown()
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
+        # Uvicorn runs in its own thread/loop, so its graceful-shutdown
+        # hook fires there. Join the thread so we don't race the final
+        # "complete" log line.
+        if self._dashboard_thread is not None:
+            self._dashboard_thread.join(timeout=10.0)
 
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        # Drop the shared Ollama httpx client and its connection pool.
+        await aclose_shared_client()
         audit("system_stop")
         logger.info("[shutdown] complete")
 

@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="filter-bar">
+  <div class="filter-bar__title">LANE DETAIL // viewing <b>{{ view_mode | upper }}</b> book</div>
+  <div class="filter-bar__links">
+    <a href="/shadow-trading?view=shadow" class="{{ 'active' if view_mode == 'shadow' else '' }}">SHADOW</a>
+    <a href="/shadow-trading?view=real" class="{{ 'active' if view_mode == 'real' else '' }}">REAL</a>
+  </div>
+</section>
+
+<section class="stats-row">
+  <div class="stat stat--{{ view_mode }}">
+    <div class="stat__label">{{ view_mode | upper }} // realized</div>
+    <div class="stat__val">${{ '%+.2f'|format(total_realized) }}</div>
+    <div class="stat__sub">unrealized <b>${{ '%+.2f'|format(total_unrealized) }}</b></div>
+  </div>
+  <div class="stat">
+    <div class="stat__label">WIN RATE (last {{ rolling_win_n }})</div>
+    <div class="stat__val">{{ '%.0f%%'|format(rolling_win_rate * 100) }}</div>
+    <div class="stat__sub">rolling, closed only</div>
+  </div>
+  <div class="stat stat--{{ other_summary.mode }}">
+    <div class="stat__label">{{ other_summary.mode | upper }} // compare</div>
+    <div class="stat__val">${{ '%.0f'|format(other_summary.budget) }}</div>
+    <div class="stat__sub">
+      dep ${{ '%.0f'|format(other_summary.deployed) }} &middot;
+      avail ${{ '%.0f'|format(other_summary.available) }}
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat__label">NOW (UTC)</div>
+    <div class="stat__val">{{ now | datetimefmt }}</div>
+    <div class="stat__sub">epoch {{ '%.0f'|format(now) }}</div>
+  </div>
+</section>
+
+{% if recommendations %}
+<div class="card wide card--recs">
+  <h2>AUTO-ANALYSIS</h2>
+  <ul class="recs">
+    {% for r in recommendations %}<li>&raquo; {{ r }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<div class="card wide">
+  <h2>LANE BREAKDOWN // {{ view_mode | upper }}</h2>
+  <table class="dense">
+    <thead>
+      <tr>
+        <th>lane</th>
+        <th>budget</th><th>dep</th><th>avail</th><th>util</th>
+        <th>open</th><th>closed</th>
+        <th>win%</th>
+        <th>realized</th><th>unrealized</th><th>total pnl</th>
+        <th>avg win</th><th>avg loss</th>
+        <th>hold</th>
+        <th>sharpe~</th>
+        <th>state</th>
+        <th>kill</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for l in lanes %}
+      <tr>
+        <td><strong>{{ l.lane }}</strong></td>
+        <td>${{ '%.2f'|format(l.budget) }}</td>
+        <td>${{ '%.2f'|format(l.deployed) }}</td>
+        <td>${{ '%.2f'|format(l.available) }}</td>
+        <td>
+          <div class="util">
+            <div class="util__fill" style="width: {{ (l.deployed / l.budget * 100) if l.budget > 0 else 0 }}%"></div>
+            <span>{{ '%.0f%%'|format((l.deployed / l.budget * 100) if l.budget > 0 else 0) }}</span>
+          </div>
+        </td>
+        <td>{{ l.open }}</td>
+        <td>{{ l.closed }}</td>
+        <td>{{ '%.0f%%'|format(l.win_rate * 100) }}</td>
+        <td class="{{ 'ok' if l.realized_pnl > 0 else ('bad' if l.realized_pnl < 0 else 'muted') }}">${{ '%+.2f'|format(l.realized_pnl) }}</td>
+        <td class="{{ 'ok' if l.unrealized_pnl > 0 else ('bad' if l.unrealized_pnl < 0 else 'muted') }}">${{ '%+.2f'|format(l.unrealized_pnl) }}</td>
+        <td class="{{ 'ok' if l.total_pnl > 0 else ('bad' if l.total_pnl < 0 else 'muted') }}"><strong>${{ '%+.2f'|format(l.total_pnl) }}</strong></td>
+        <td>${{ '%+.2f'|format(l.avg_win) }}</td>
+        <td>${{ '%+.2f'|format(l.avg_loss) }}</td>
+        <td>
+          {% if l.avg_hold_seconds >= 3600 %}
+            {{ '%.1fh'|format(l.avg_hold_seconds / 3600) }}
+          {% else %}
+            {{ '%.0fm'|format(l.avg_hold_seconds / 60) }}
+          {% endif %}
+        </td>
+        <td>{{ '%.2f'|format(l.sharpe_like) }}</td>
+        <td>
+          {% if l.paused %}
+            <span class="status status--paused">PAUSED</span>
+          {% else %}
+            <span class="status status--open">ACTIVE</span>
+          {% endif %}
+        </td>
+        <td>
+          <form method="post" action="/shadow-trading/pause" style="display:inline">
+            <input type="hidden" name="lane" value="{{ l.lane }}">
+            <input type="hidden" name="view" value="{{ view_mode }}">
+            {% if l.paused %}
+              <button name="action" value="unpause" class="btn--small">RESUME</button>
+            {% else %}
+              <button name="action" value="pause" class="btn--small btn--warn">PAUSE</button>
+            {% endif %}
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <form method="post" action="/shadow-trading/pause" class="inline-form" style="margin-top:12px">
+    <input type="hidden" name="lane" value="all">
+    <input type="hidden" name="view" value="{{ view_mode }}">
+    <button name="action" value="pause" class="danger">&#9632; PAUSE ALL {{ view_mode | upper }} LANES</button>
+    <button name="action" value="unpause">&#9654; RESUME ALL</button>
+  </form>
+</div>
+
+<div class="card wide">
+  <h2>RECENT TRADES // {{ view_mode | upper }} &middot; {{ recent|length }}</h2>
+  <table class="dense">
+    <thead>
+      <tr>
+        <th>age</th><th>lane</th><th>market</th><th>side</th>
+        <th>entry</th><th>last</th><th>size $</th>
+        <th>status</th><th>pnl</th><th>reason</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for p in recent %}
+      <tr>
+        <td class="muted">{{ p.age_ago }}</td>
+        <td>{{ p.lane }}</td>
+        <td class="q">
+          <div class="q__q">{{ p.question[:60] }}{% if p.question|length > 60 %}…{% endif %}</div>
+          <div class="q__m"><code>{{ p.market_id[:14] }}…</code></div>
+        </td>
+        <td class="{{ 'side-buy' if p.side == 'BUY' else 'side-sell' }}">{{ p.side }}</td>
+        <td>{{ '%.3f'|format(p.entry_price) }}</td>
+        <td>{{ '%.3f'|format(p.last_price) }}</td>
+        <td>${{ '%.2f'|format(p.size_usd) }}</td>
+        <td><span class="status status--{{ p.status|lower }}">{{ p.status }}</span></td>
+        <td class="{{ 'ok' if p.pnl_usd > 0 else ('bad' if p.pnl_usd < 0 else 'muted') }}">
+          ${{ '%+.2f'|format(p.pnl_usd) }}
+        </td>
+        <td class="muted">{% if p.status == 'CLOSED' %}{{ p.close_reason }}{% else %}{{ p.entry_reason[:32] }}{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

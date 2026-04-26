@@ -25,10 +25,11 @@ from core.utils.config import get_config
 from core.utils.db import execute, fetch_all, fetch_one
 from core.utils.hashing import url_hash
 from core.utils.helpers import Backoff, now_ts
+from core.utils.watchdog import is_degraded
 
 GAMMA_MARKET_URL = "https://gamma-api.polymarket.com/markets/{market_id}"
 _HEADERS = {
-    "User-Agent": "Quantorpolybot/0.1 (+https://github.com/local)",
+    "User-Agent": "NexoPolyBot/0.1 (+https://github.com/local)",
     "Accept": "application/json",
 }
 # Crude URL extractor for description bodies that don't carry a
@@ -58,6 +59,15 @@ class PolymarketNewsFeed:
         logger.info("[poly_news] starting; poll={}s per_cycle={}", poll, per_cycle)
         async with httpx.AsyncClient(timeout=20.0, headers=_HEADERS) as client:
             while not self._stop.is_set():
+                # When the event loop is under pressure, polymarket_news is
+                # the lowest-value feed (per-market Gamma lookups). Skip
+                # the cycle entirely rather than throttle — frees the pool
+                # for order/signal traffic. Watchdog DEGRADED flip-off
+                # happens after ~3min of clean ticks.
+                if is_degraded():
+                    logger.debug("[poly_news] degraded — skipping cycle")
+                    await self._sleep(poll)
+                    continue
                 try:
                     new = await self._poll_cycle(client, per_cycle, delay)
                     if new:
@@ -67,7 +77,14 @@ class PolymarketNewsFeed:
                     raise
                 except Exception as e:
                     d = backoff.next_delay()
-                    logger.exception("[poly_news] error, sleeping {:.1f}s: {}", d, e)
+                    # httpx ConnectError/ConnectTimeout stringify to '' —
+                    # fall back to the class name so the log line isn't
+                    # truncated after the colon.
+                    detail = str(e) or type(e).__name__
+                    logger.warning(
+                        "[poly_news] error ({}), sleeping {:.1f}s: {}",
+                        type(e).__name__, d, detail,
+                    )
                     await self._sleep(d)
                     continue
                 await self._sleep(poll)

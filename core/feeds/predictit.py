@@ -22,14 +22,18 @@ from typing import Any
 import httpx
 from loguru import logger
 
+from core.feeds.predictit_match import match as predictit_match
 from core.utils.config import get_config
 from core.utils.db import execute, fetch_all, fetch_one
 from core.utils.hashing import url_hash
-from core.utils.helpers import Backoff, jaccard, keywords, now_ts, safe_float
+from core.utils.helpers import Backoff, now_ts, safe_float
+from core.utils.watchdog import is_degraded
+
+DEGRADED_POLL_MULTIPLIER = 2
 
 API_URL = "https://www.predictit.org/api/marketdata/all/"
 _HEADERS = {
-    "User-Agent": "Quantorpolybot/0.1 (+https://github.com/local)",
+    "User-Agent": "NexoPolyBot/0.1 (+https://github.com/local)",
     "Accept": "application/json",
 }
 
@@ -68,10 +72,13 @@ class PredictItFeed:
                     raise
                 except Exception as e:
                     d = backoff.next_delay()
-                    logger.exception("[predictit] error, sleeping {:.1f}s: {}", d, e)
+                    logger.warning(
+                        "[predictit] error ({}), sleeping {:.1f}s: {}",
+                        type(e).__name__, d, e,
+                    )
                     await self._sleep(d)
                     continue
-                await self._sleep(poll)
+                await self._sleep(poll * DEGRADED_POLL_MULTIPLIER if is_degraded() else poll)
 
     async def stop(self) -> None:
         self._stop.set()
@@ -98,43 +105,53 @@ class PredictItFeed:
         )
         if not poly_rows:
             return 0, 0
-        # Pre-tokenize Polymarket questions once; we'll Jaccard-match
-        # every PredictIt contract against this list.
-        poly_index: list[tuple[str, str, set[str], float | None]] = []
-        for row in poly_rows:
-            q = row["question"] or ""
-            mid = _mid_from_row(row)
-            poly_index.append((str(row["market_id"]), q, keywords(q), mid))
+        poly_index: list[tuple[str, str, float | None]] = [
+            (str(row["market_id"]), row["question"] or "", _mid_from_row(row))
+            for row in poly_rows
+        ]
 
         matched = 0
         signaled = 0
+        rejected = 0
         ts = now_ts()
+        # `threshold` retained for backwards-compat but unused by the
+        # rule-based matcher; left in the call signature so config
+        # tweaks don't need a migration.
+        _ = threshold
         for market in markets:
             if not isinstance(market, dict):
                 continue
+            market_name = market.get("name") or ""
             for contract in market.get("contracts") or []:
                 if not isinstance(contract, dict):
                     continue
-                pi_name = (contract.get("name") or market.get("name") or "").strip()
+                pi_name = (contract.get("name") or market_name or "").strip()
                 if not pi_name:
                     continue
                 pi_price = _contract_price(contract)
                 if pi_price is None:
                     continue
-                pi_kw = keywords(f"{market.get('name', '')} {pi_name}")
-                if not pi_kw:
-                    continue
-                # Pick the best Polymarket question above the threshold.
-                best: tuple[float, str, str, float | None] | None = None
-                for poly_id, poly_q, poly_kw, poly_mid in poly_index:
-                    score = jaccard(pi_kw, poly_kw)
-                    if score < threshold:
+                pi_text = f"{market_name} {pi_name}".strip()
+                # First accepted Polymarket question wins. The rule set
+                # is strict so multiple candidates rarely tie; if they
+                # do, the first active market is fine — the alternative
+                # (silently picking one via ranking) loses traceability.
+                accepted: tuple[str, str, float | None, str] | None = None
+                last_reason = ""
+                for poly_id, poly_q, poly_mid in poly_index:
+                    ok, reason = predictit_match(pi_text, poly_q)
+                    if not ok:
+                        last_reason = reason
                         continue
-                    if best is None or score > best[0]:
-                        best = (score, poly_id, poly_q, poly_mid)
-                if best is None:
+                    accepted = (poly_id, poly_q, poly_mid, reason)
+                    break
+                if accepted is None:
+                    rejected += 1
+                    logger.debug(
+                        "[predictit] reject {!r}: {}", pi_text[:80], last_reason,
+                    )
                     continue
-                score, poly_id, poly_q, poly_mid = best
+                poly_id, poly_q, poly_mid, match_reason = accepted
                 if poly_mid is None:
                     continue
                 divergence = abs(pi_price - poly_mid)
@@ -156,9 +173,15 @@ class PredictItFeed:
                 matched += 1
                 if divergence >= auto_div:
                     if await self._emit_signal(
-                        poly_id, poly_q, pi_name, pi_price, poly_mid, divergence, score
+                        poly_id, poly_q, pi_name, pi_price, poly_mid,
+                        divergence, match_reason,
                     ):
                         signaled += 1
+        if rejected:
+            logger.info(
+                "[predictit] filtered {} contracts as non-matches (new stricter rules)",
+                rejected,
+            )
         return matched, signaled
 
     async def _emit_signal(
@@ -169,7 +192,7 @@ class PredictItFeed:
         pi_price: float,
         poly_mid: float,
         divergence: float,
-        match_score: float,
+        match_reason: str,
     ) -> bool:
         # Bucket by ~hour so the same persistent divergence doesn't spam
         # the pipeline every cycle, but a *new* large move still fires.
@@ -184,7 +207,7 @@ class PredictItFeed:
         summary = (
             f"PredictIt contract '{pi_name}' trades at {pi_price:.3f} while "
             f"Polymarket mid is {poly_mid:.3f} (divergence {divergence:.3f}, "
-            f"match score {match_score:.2f}). Consider whether new info on "
+            f"match: {match_reason}). Consider whether new info on "
             f"either side justifies the gap."
         )
         meta = {
@@ -193,7 +216,7 @@ class PredictItFeed:
             "predictit_price": pi_price,
             "polymarket_mid": poly_mid,
             "divergence": divergence,
-            "match_score": match_score,
+            "match_reason": match_reason,
         }
         await execute(
             """INSERT OR IGNORE INTO feed_items

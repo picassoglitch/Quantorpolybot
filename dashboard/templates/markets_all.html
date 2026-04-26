@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block content %}
+
+{# Defensive: backend always passes `tape`, but if a future handler edit
+   drops it, the page still renders instead of 500-ing the whole route. #}
+{% set tape = tape | default({}) %}
+{% set t_now            = tape.now            | default(0) %}
+{% set t_total_active   = tape.total_active   | default(rows | length) %}
+{% set t_signals_1h     = tape.signals_1h     | default(0) %}
+{% set t_signals_24h    = tape.signals_24h    | default(0) %}
+{% set t_approved_24h   = tape.approved_24h   | default(0) %}
+{% set t_open_positions = tape.open_positions | default(0) %}
+{% set t_open_exposure  = tape.open_exposure  | default(0.0) %}
+{% set t_last_trade_ts  = tape.last_trade_ts  | default(0) %}
+
+<div class="mkx-top mkx-top--reverse">
+  <a href="/markets" class="mkx-all-link">[ FOCUS VIEW ]</a>
+</div>
+
+{# ---------- Top ticker strip: what is the bot doing right now ---------- #}
+<section class="mkt-tape">
+  <div class="mkt-tape__stat">
+    <span class="mkt-tape__label">CLOCK UTC</span>
+    <span class="mkt-tape__val mkt-tape__val--accent">
+      {% if t_now %}{{ t_now | datetimefmt }}{% else %}—{% endif %}
+    </span>
+  </div>
+  <div class="mkt-tape__stat">
+    <span class="mkt-tape__label">WATCHLIST</span>
+    <span class="mkt-tape__val">{{ t_total_active }}</span>
+    <span class="mkt-tape__hint">markets</span>
+  </div>
+  <div class="mkt-tape__stat">
+    <span class="mkt-tape__label">SIGNALS&nbsp;1H</span>
+    <span class="mkt-tape__val">{{ t_signals_1h }}</span>
+    <span class="mkt-tape__hint">/ 24h {{ t_signals_24h }}</span>
+  </div>
+  <div class="mkt-tape__stat">
+    <span class="mkt-tape__label">APPROVED&nbsp;24H</span>
+    <span class="mkt-tape__val {% if t_approved_24h > 0 %}mkt-tape__val--good{% endif %}">{{ t_approved_24h }}</span>
+  </div>
+  <div class="mkt-tape__stat">
+    <span class="mkt-tape__label">OPEN POS</span>
+    <span class="mkt-tape__val {% if t_open_positions > 0 %}mkt-tape__val--accent{% endif %}">{{ t_open_positions }}</span>
+    <span class="mkt-tape__hint">${{ '%.2f'|format(t_open_exposure) }}</span>
+  </div>
+  <div class="mkt-tape__stat">
+    <span class="mkt-tape__label">LAST TRADE</span>
+    <span class="mkt-tape__val">
+      {% if t_last_trade_ts %}{{ t_last_trade_ts | datetimefmt }}{% else %}—{% endif %}
+    </span>
+  </div>
+</section>
+
+{# ---------- Market depth-of-book table ---------- #}
+<div class="card wide card--tape">
+  <h2>ACTIVE MARKETS // BOT FOOTPRINT // {{ rows|length }}</h2>
+  <p class="muted small">
+    Sorted by liquidity. <b>ACT</b> column = bot's activity on this market:
+    <span class="act act--pos">POS</span> open position ·
+    <span class="act act--sig">SIG</span> recent approved signal ·
+    <span class="act act--rej">REJ</span> scored but rejected ·
+    <span class="act act--watch">WATCH</span> seen in feed ·
+    <span class="act act--idle">IDLE</span> nothing scored yet.
+    The tick arrow on LAST shows direction vs mid.
+  </p>
+  <table class="dense tape tape--mkt">
+    <thead>
+      <tr>
+        <th>market</th>
+        <th>question</th>
+        <th>cat</th>
+        <th class="num">bid</th>
+        <th class="num">ask</th>
+        <th class="num">spread¢</th>
+        <th class="num">mid</th>
+        <th class="num">last</th>
+        <th class="num">liquidity</th>
+        <th>act</th>
+        <th>last&nbsp;sig</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+      {% set bid = r.best_bid or 0 %}
+      {% set ask = r.best_ask or 0 %}
+      {% set last = r.last_price or 0 %}
+      {% set mid = ((bid + ask) / 2) if (bid > 0 and ask > 0) else last %}
+      {% set spread_c = (ask - bid) * 100 %}
+      {% set status_l = (r.last_sig_status or '') | lower %}
+      {% if r.open_positions and r.open_positions > 0 %}
+        {% set act = 'pos' %}
+      {% elif status_l == 'approved' %}
+        {% set act = 'sig' %}
+      {% elif status_l == 'rejected' or status_l == 'implausible_edge' or status_l == 'below_min_edge' %}
+        {% set act = 'rej' %}
+      {% elif status_l in ('market_throttled', 'keyword_mismatch', 'long_horizon', 'duplicate', 'stale_market') %}
+        {% set act = 'watch' %}
+      {% else %}
+        {% set act = 'idle' %}
+      {% endif %}
+      {% set tick = 'flat' %}
+      {% if last and mid and (last - mid) > 0.002 %}{% set tick = 'up' %}{% endif %}
+      {% if last and mid and (mid - last) > 0.002 %}{% set tick = 'down' %}{% endif %}
+      <tr class="mkt-row mkt-row--act-{{ act }}">
+        <td><code>{{ r.market_id[:10] }}…</code></td>
+        <td class="q">{{ (r.question or '')[:95] }}</td>
+        <td>
+          {% if r.category %}
+            {% set cat_l = (r.category or '') | lower %}
+            <span class="chip chip--{{ cat_l|replace(' ', '-')|replace('/', '-') }}">{{ r.category }}</span>
+          {% endif %}
+        </td>
+        <td class="num side-buy">{{ '%.3f'|format(bid) }}</td>
+        <td class="num side-sell">{{ '%.3f'|format(ask) }}</td>
+        <td class="num muted">{{ '%.1f'|format(spread_c) }}</td>
+        <td class="num">{{ '%.3f'|format(mid) }}</td>
+        <td class="num tick tick--{{ tick }}">
+          {% if tick == 'up' %}▲{% elif tick == 'down' %}▼{% else %}·{% endif %}
+          {{ '%.3f'|format(last) }}
+        </td>
+        <td class="num">
+          <span class="liq-cell">
+            <span class="liq-bar">
+              <span class="liq-bar__fill" style="width: {{ [ (((r.liquidity or 0) / 100000) * 100) | round(0, 'floor'), 100 ] | min }}%;"></span>
+            </span>
+            <span class="liq-num">${{ '%.0f'|format(r.liquidity or 0) }}</span>
+          </span>
+        </td>
+        <td><span class="act act--{{ act }}">{{ act | upper }}</span></td>
+        <td class="muted small">
+          {% if r.last_sig_ts %}
+            {{ r.last_sig_ts | datetimefmt }}
+            {% if r.last_sig_status %}
+              <span class="sig-status sig-status--{{ status_l }}">{{ r.last_sig_status | signalstatus }}</span>
+            {% endif %}
+            {% if r.last_sig_side and r.last_sig_side != 'NONE' %}
+              <span class="{{ 'side-buy' if r.last_sig_side == 'BUY' else 'side-sell' }}">{{ r.last_sig_side }}</span>
+            {% endif %}
+          {% else %}
+            —
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

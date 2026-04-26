@@ -1,7 +1,9 @@
 """Per-market trade cooldown.
 
-Looks at the last order timestamp for a market and returns True if the
-cooldown window hasn't elapsed yet.
+Looks at the most recent shadow/real entry on a market and returns True
+if the cooldown window hasn't elapsed yet. Covers both modes — rapid
+re-entry after a close is what the cooldown is guarding against, and we
+don't care whether it was simulated or real.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ async def market_in_cooldown(market_id: str, cooldown_seconds: float) -> bool:
     if cooldown_seconds <= 0:
         return False
     row = await fetch_one(
-        "SELECT MAX(created_at) AS last FROM orders WHERE market_id=?",
+        "SELECT MAX(entry_ts) AS last FROM shadow_positions WHERE market_id=?",
         (market_id,),
     )
     if row is None or row["last"] is None:

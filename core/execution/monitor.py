@@ -1,12 +1,19 @@
-"""Order monitor.
+"""Real-mode CLOB order reconciliation.
 
-For LIVE orders:
-  - Polls CLOB for fills, records executions, updates positions.
-  - Cancels orders that exceed `order_timeout_seconds`.
+When a lane opens a position in real mode, `shadow.open_position` posts
+a GTC limit order via `clob_client` and parks the row with
+`status='PENDING_FILL'`. This monitor polls the CLOB for each pending
+order and transitions the row:
 
-For DRY_RUN orders:
-  - Pretends fill at the limit price after a small delay so the rest of
-    the system (positions, risk caps, learning loop) sees realistic data.
+  matched / filled  → status='OPEN', entry_price replaced with the fill
+                      price, entry_ts bumped to the fill timestamp
+  cancelled / rejected → status='CLOSED' with reason='clob_rejected',
+                      capital released, no PnL
+  older than order_timeout_seconds with no fill → cancel on CLOB, then
+                      transition to CLOSED with reason='clob_timeout'
+
+Shadow-mode rows (`is_real=0`) are ignored here — they land directly in
+OPEN on creation.
 """
 
 from __future__ import annotations
@@ -15,11 +22,11 @@ import asyncio
 
 from loguru import logger
 
-from core.execution import clob_client
-from core.state.positions import upsert_from_fill
+from core.execution import allocator, clob_client
 from core.utils.config import get_config
 from core.utils.db import execute, fetch_all
 from core.utils.helpers import now_ts, safe_float
+from core.utils.logging import audit
 
 
 class OrderMonitor:
@@ -35,8 +42,7 @@ class OrderMonitor:
         logger.info("[monitor] started poll={}s timeout={}s", poll, timeout)
         while not self._stop.is_set():
             try:
-                await self._poll_dry_run()
-                await self._poll_live(timeout)
+                await self._reconcile_pending(timeout)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -52,68 +58,74 @@ class OrderMonitor:
         except asyncio.TimeoutError:
             return
 
-    async def _poll_dry_run(self) -> None:
+    async def _reconcile_pending(self, timeout_seconds: float) -> None:
         rows = await fetch_all(
-            "SELECT * FROM orders WHERE dry_run=1 AND status='DRY_RUN' AND created_at <= ?",
-            (now_ts() - 1.0,),
-        )
-        for r in rows:
-            price = safe_float(r["price"])
-            size = safe_float(r["size"])
-            await upsert_from_fill(r["market_id"], r["token_id"], r["side"], price, size)
-            await execute(
-                "INSERT INTO executions (order_id, clob_trade_id, market_id, token_id, side, price, size, ts) VALUES (?,?,?,?,?,?,?,?)",
-                (r["id"], "dry-run", r["market_id"], r["token_id"], r["side"], price, size, now_ts()),
-            )
-            await execute(
-                "UPDATE orders SET status=?, updated_at=? WHERE id=?",
-                ("FILLED_DRY", now_ts(), r["id"]),
-            )
-
-    async def _poll_live(self, timeout_seconds: float) -> None:
-        rows = await fetch_all(
-            "SELECT * FROM orders WHERE dry_run=0 AND status IN ('OPEN','PENDING')"
+            """SELECT id, strategy, market_id, token_id, side, entry_price,
+                      size_usd, size_shares, entry_ts, clob_order_id
+               FROM shadow_positions
+               WHERE status='PENDING_FILL' AND COALESCE(is_real, 0)=1"""
         )
         now = now_ts()
         for r in rows:
-            order_id = r["id"]
             cid = r["clob_order_id"] or ""
-            age = now - safe_float(r["created_at"])
+            age = now - safe_float(r["entry_ts"])
             if not cid:
+                # Submitted without an ID (shouldn't happen, but treat as lost).
                 if age > timeout_seconds:
-                    await execute(
-                        "UPDATE orders SET status=?, updated_at=? WHERE id=?",
-                        ("TIMEOUT", now, order_id),
-                    )
+                    await self._fail(r, "clob_no_order_id")
                 continue
             status = await clob_client.order_status(cid)
             state = (status.get("status") or status.get("state") or "").lower()
             filled = safe_float(status.get("size_matched") or status.get("filled_size"))
-            if state in ("matched", "filled") or filled >= safe_float(r["size"]) > 0:
-                price = safe_float(status.get("price") or r["price"])
-                size = safe_float(status.get("size_matched") or r["size"])
+            requested = safe_float(r["size_shares"])
+            if state in ("matched", "filled") or (requested > 0 and filled >= requested):
+                fill_price = safe_float(status.get("price") or r["entry_price"])
                 await execute(
-                    "INSERT INTO executions (order_id, clob_trade_id, market_id, token_id, side, price, size, ts) VALUES (?,?,?,?,?,?,?,?)",
-                    (
-                        order_id,
-                        status.get("trade_id") or cid,
-                        r["market_id"],
-                        r["token_id"],
-                        r["side"],
-                        price,
-                        size,
-                        now,
-                    ),
+                    """UPDATE shadow_positions
+                       SET status='OPEN', entry_price=?, last_price=?,
+                           last_price_ts=?
+                       WHERE id=?""",
+                    (fill_price, fill_price, now, r["id"]),
                 )
-                await upsert_from_fill(r["market_id"], r["token_id"], r["side"], price, size)
-                await execute(
-                    "UPDATE orders SET status=?, updated_at=? WHERE id=?",
-                    ("FILLED", now, order_id),
+                audit(
+                    "real_fill",
+                    position_id=r["id"],
+                    market_id=r["market_id"],
+                    clob_order_id=cid,
+                    fill_price=fill_price,
+                    size_usd=safe_float(r["size_usd"]),
                 )
-            elif age > timeout_seconds:
+                logger.info(
+                    "[monitor] FILL pos={} {} {} @ {:.3f}",
+                    r["id"], r["side"], r["market_id"], fill_price,
+                )
+                continue
+            if state in ("cancelled", "canceled", "rejected", "expired"):
+                await self._fail(r, f"clob_{state}")
+                continue
+            if age > timeout_seconds:
                 ok = await clob_client.cancel_order(cid)
-                await execute(
-                    "UPDATE orders SET status=?, updated_at=? WHERE id=?",
-                    ("CANCELLED" if ok else "CANCEL_FAILED", now, order_id),
-                )
-                logger.info("[monitor] cancelled stale order {} ({:.0f}s old)", cid, age)
+                await self._fail(r, "clob_timeout" if ok else "clob_timeout_cancel_failed")
+
+    async def _fail(self, row, reason: str) -> None:
+        """Transition a PENDING_FILL row to CLOSED, release capital."""
+        await execute(
+            """UPDATE shadow_positions
+               SET status='CLOSED', close_ts=?, close_reason=?,
+                   realized_pnl_usd=0
+               WHERE id=?""",
+            (now_ts(), reason, row["id"]),
+        )
+        await allocator.release(
+            row["strategy"], safe_float(row["size_usd"]), 0.0, mode="real",
+        )
+        audit(
+            "real_open_aborted",
+            position_id=row["id"],
+            market_id=row["market_id"],
+            reason=reason,
+        )
+        logger.warning(
+            "[monitor] aborted pending pos={} market={} reason={}",
+            row["id"], row["market_id"], reason,
+        )

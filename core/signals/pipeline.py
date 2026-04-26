@@ -14,28 +14,44 @@ from typing import Any
 
 from loguru import logger
 
-from core.execution.orders import OrderEngine
 from core.markets.cache import get_market
 from core.risk.rules import RiskEngine, RiskRejection
 from core.signals.candidates import (
     scored_candidates_for,
     serialize_candidates,
 )
+from core.signals.context import build_market_context
+from core.learning.source_trust import get_source_weights, trust_weight_for
+from core.signals.guards import apply_true_prob_cap, guard_config, hallucination_reject
 from core.signals.ollama_client import OllamaClient
 from core.utils.config import get_config, get_prompts
 from core.utils.db import execute, fetch_all, fetch_one
 from core.utils.helpers import clamp, now_ts, safe_float
+from core.utils.prices import days_until_resolve
 
 
 class SignalPipeline:
     component = "signals.pipeline"
 
-    def __init__(self, order_engine: OrderEngine, risk: RiskEngine) -> None:
+    def __init__(self, risk: RiskEngine) -> None:
         self._stop = asyncio.Event()
         self._ollama = OllamaClient()
-        self._orders = order_engine
         self._risk = risk
         self._cursor_id = 0  # last processed feed_items.id
+        # Throttle the "processed N items" log: during a backlog catch-up
+        # the pipeline chews through thousands of pre-filter skips per
+        # second, which drowns the log. Summarise to one line every 5s.
+        self._processed_since_log = 0
+        self._last_log_ts = 0.0
+        # Per-market "last Ollama-scored at" timestamp. Multiple feeds
+        # (google_news, polymarket_news, RSS cross-posts) often tag the
+        # same market in rapid succession — the dashboard showed the
+        # same Croatia WC market being deep-scored 7 times back-to-back
+        # for 0 benefit. Throttle re-scoring per market so we spend GPU
+        # time on genuinely new candidates instead. Runtime-mutable so
+        # ``signals.market_rescore_cooldown_seconds`` takes effect on
+        # config reload without a restart.
+        self._market_last_scored: dict[str, float] = {}
 
     async def run(self) -> None:
         await self._init_cursor()
@@ -44,9 +60,28 @@ class SignalPipeline:
             try:
                 processed = await self._process_batch()
                 if processed == 0:
+                    if self._processed_since_log:
+                        logger.info(
+                            "[signals] processed {} items (backlog drained)",
+                            self._processed_since_log,
+                        )
+                        self._processed_since_log = 0
+                        self._last_log_ts = now_ts()
                     await self._sleep(2)
                 else:
-                    logger.info("[signals] processed {} items", processed)
+                    self._processed_since_log += processed
+                    ts = now_ts()
+                    if ts - self._last_log_ts >= 5.0:
+                        logger.info(
+                            "[signals] processed {} items (last 5s)",
+                            self._processed_since_log,
+                        )
+                        self._processed_since_log = 0
+                        self._last_log_ts = ts
+                    # Yield briefly on a full batch so other coroutines
+                    # (WS ingest, order monitor) aren't starved during
+                    # catch-up. 10ms is below the batch runtime floor.
+                    await asyncio.sleep(0.01)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -93,6 +128,45 @@ class SignalPipeline:
         if not scored:
             return
         markets = [m for _, m in scored]
+
+        # Per-market rescore cooldown. If the top candidate was Ollama-
+        # scored within the cooldown window, skip the LLM call and log
+        # a cheap throttled signal row so the audit trail shows why the
+        # feed item didn't fire. Without this guard the pipeline
+        # happily burns ~5s of deep-tier time on duplicate signals for
+        # the same market every time a new news item tags it.
+        cooldown = float(
+            get_config().get(
+                "signals", "market_rescore_cooldown_seconds", default=180,
+            )
+        )
+        if cooldown > 0 and markets:
+            top_mid = str(markets[0].market_id)
+            last_ts = self._market_last_scored.get(top_mid, 0.0)
+            age = now_ts() - last_ts
+            if last_ts > 0 and age < cooldown:
+                await execute(
+                    """INSERT INTO signals
+                    (feed_item_id, market_id, implied_prob, confidence, edge,
+                     mid_price, side, size_usd, reasoning, prompt_version,
+                     created_at, status)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        int(item["id"]),
+                        top_mid,
+                        0.0, 0.0, 0.0, 0.0,
+                        "NONE",
+                        0.0,
+                        (
+                            f"market_rescore_throttle age={age:.0f}s "
+                            f"cooldown={cooldown:.0f}s"
+                        ),
+                        "prefilter",
+                        now_ts(),
+                        "market_throttled",
+                    ),
+                )
+                return
         # Pre-filter: feeds that already nominate a specific market
         # (polymarket_news, predictit_xref, google_news per-market query)
         # bypass the keyword check; everything else must clear the
@@ -130,6 +204,52 @@ class SignalPipeline:
                     ),
                 )
                 return
+        # Long-horizon candidate pre-filter. We don't run any strategy
+        # that benefits from >12-month markets (longshot's widest
+        # window is 180d; event_sniping's is 14d; scalping wants
+        # near-term) and historically these markets are thin-liquidity
+        # junk — 2028 elections, far-future crypto, World Cup round-
+        # of-16 prop bets. Drop them BEFORE the Ollama call. If every
+        # candidate is too far out, log one `long_horizon_skip` row
+        # for the audit trail and skip the item.
+        sig_cfg = get_config().get("signals") or {}
+        max_candidate_days = safe_float(
+            sig_cfg.get("max_candidate_days", 365)
+        )
+        if max_candidate_days > 0:
+            filtered_markets: list[Any] = []
+            for m in markets:
+                d = days_until_resolve(m.close_time)
+                if d is None or d <= max_candidate_days:
+                    filtered_markets.append(m)
+            if not filtered_markets:
+                # Represent the skip so the signals page / reviewer
+                # can see what happened — attributed to the top
+                # heuristic candidate so the market_id column stays
+                # populated.
+                top_mid = str(markets[0].market_id)
+                await execute(
+                    """INSERT INTO signals
+                    (feed_item_id, market_id, implied_prob, confidence, edge,
+                     mid_price, side, size_usd, reasoning, prompt_version,
+                     created_at, status)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        int(item["id"]),
+                        top_mid,
+                        0.0, 0.0, 0.0, 0.0,
+                        "NONE",
+                        0.0,
+                        f"long_horizon_skip all candidates resolve "
+                        f"> {max_candidate_days:.0f}d out",
+                        "prefilter",
+                        now_ts(),
+                        "long_horizon",
+                    ),
+                )
+                return
+            markets = filtered_markets
+
         prompt_version, template = get_prompts().active()
         news_item_json = json.dumps(
             {
@@ -141,6 +261,19 @@ class SignalPipeline:
             ensure_ascii=False,
         )
         candidates_json = json.dumps(serialize_candidates(markets), ensure_ascii=False)
+        # Build per-candidate context concurrently so the prompt can reason
+        # about price trajectory / peer signals / news frequency per market
+        # — not just the news text in isolation. Best-effort: any failure
+        # gives an empty dict for that market so the prompt still renders.
+        contexts = await asyncio.gather(
+            *(build_market_context(m.market_id) for m in markets),
+            return_exceptions=True,
+        )
+        ctx_map = {
+            m.market_id: (c if isinstance(c, dict) else {})
+            for m, c in zip(markets, contexts)
+        }
+        context_json = json.dumps(ctx_map, ensure_ascii=False)
         # Use .replace() not .format() — the prompt template contains a literal
         # JSON schema example with {} braces that would otherwise blow up
         # str.format with KeyError on the inner JSON keys.
@@ -148,6 +281,7 @@ class SignalPipeline:
             template
             .replace("{news_item}", news_item_json)
             .replace("{candidates}", candidates_json)
+            .replace("{context}", context_json)
         )
         result = await self._ollama.generate_json(prompt)
         if not result:
@@ -159,18 +293,77 @@ class SignalPipeline:
         if not market:
             return
 
+        # Record that we just scored this market so the next feed item
+        # tagging it hits the cooldown above. We key on the market the
+        # LLM actually picked (not the top heuristic candidate), since
+        # the prompt can and does rebalance across the candidate list.
+        self._market_last_scored[str(market.market_id)] = now_ts()
+        # GC the dict when it grows past ~2k entries — pathological feeds
+        # would otherwise accumulate one entry per ever-seen market.
+        if len(self._market_last_scored) > 2000:
+            cutoff = now_ts() - max(
+                float(get_config().get(
+                    "signals", "market_rescore_cooldown_seconds", default=180,
+                )) * 4,
+                900.0,
+            )
+            self._market_last_scored = {
+                mid: ts for mid, ts in self._market_last_scored.items()
+                if ts >= cutoff
+            }
+
         implied = clamp(safe_float(result.get("implied_prob")), 0.0, 1.0)
         confidence = clamp(safe_float(result.get("confidence")), 0.0, 1.0)
         reasoning = (result.get("reasoning") or "")[:500]
         mid = market.mid
+
+        # ---- Sanity guards on the LLM output ----
+        # Long-horizon cap: resolutions > N days out shouldn't get
+        # 99%-confidence priors. Clamp true_prob so the edge calc
+        # doesn't explode.
+        guards = guard_config(get_config().get("risk"))
+        days = days_until_resolve(market.close_time)
+        capped_implied = apply_true_prob_cap(
+            implied,
+            days,
+            long_horizon_days=guards["long_horizon_days"],
+            cap=guards["long_horizon_cap"],
+        )
+        if capped_implied != implied:
+            reasoning = (
+                reasoning + f" [long_horizon_cap {implied:.2f}->{capped_implied:.2f}]"
+            )[:500]
+            implied = capped_implied
+
+        # Hallucination guard: on markets where the current mid is
+        # very low, high LLM priors are the #1 cause of bad trades.
+        # Count unique evidence sources linked to this market in
+        # recent feed items and reject when corroboration is thin.
+        # Weighted count reflects per-source trust calibration (see
+        # core.learning.source_trust); unknown sources fall back to
+        # 1.0 so pre-calibration behaviour is preserved.
+        num_sources, weighted_sources = await self._count_recent_sources(
+            str(market.market_id),
+        )
+        reject_reason = hallucination_reject(
+            true_prob=implied,
+            mid=mid,
+            num_sources=num_sources,
+            weighted_sources=weighted_sources,
+            low_mid_threshold=guards["low_mid_threshold"],
+            high_true_prob_threshold=guards["high_true_prob_threshold"],
+            min_sources=guards["min_sources"],
+        )
+
         edge = implied - mid
         side = "BUY" if edge > 0 else "SELL"
 
         signal_id = await execute(
             """INSERT INTO signals
             (feed_item_id, market_id, implied_prob, confidence, edge, mid_price,
-             side, size_usd, reasoning, prompt_version, created_at, status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+             side, size_usd, reasoning, prompt_version, created_at, status,
+             category)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 int(item["id"]),
                 market.market_id,
@@ -184,8 +377,13 @@ class SignalPipeline:
                 prompt_version,
                 now_ts(),
                 "PENDING",
+                (market.category or "").strip(),
             ),
         )
+
+        if reject_reason:
+            await self._reject(signal_id, reject_reason)
+            return
 
         cfg = get_config().get("risk") or {}
         if confidence < float(cfg.get("min_confidence", 0.65)):
@@ -194,6 +392,40 @@ class SignalPipeline:
         if abs(edge) < float(cfg.get("min_edge", 0.04)):
             await self._reject(signal_id, "edge below threshold")
             return
+        # Plausibility gate: when the market trades at a tiny implied
+        # probability and the LLM is claiming a huge edge, we're almost
+        # always looking at a hallucination — e.g. "Panama wins 2026
+        # World Cup" priced at 0.002 where Ollama quotes true_prob=0.30
+        # from a vague news headline. The hallucination_reject guard
+        # above catches the *extreme* version (low_mid + high_true_prob
+        # with thin sources); this is the softer cousin that triggers
+        # whenever the edge itself is implausibly large relative to
+        # the market price, even with sources. Keeps Ollama honest on
+        # long-tail futures without interfering with genuine event
+        # repricings (which sit closer to 0.5).
+        plausibility_max_edge = float(
+            cfg.get("plausibility_max_edge", 0.25)
+        )
+        plausibility_min_implied = float(
+            cfg.get("plausibility_min_implied", 0.05)
+        )
+        # Symmetric: catch both tails. mid<0.05 with edge>+0.25 is the
+        # "dark horse to win" hallucination; mid>0.95 with edge<-0.25
+        # is the mirror ("favorite will actually lose") case. Either
+        # way the market is already pricing an extreme — outsized edge
+        # against that pricing is almost always model error.
+        in_low_tail = mid < plausibility_min_implied
+        in_high_tail = mid > (1.0 - plausibility_min_implied)
+        if (
+            plausibility_max_edge > 0
+            and abs(edge) > plausibility_max_edge
+            and (in_low_tail or in_high_tail)
+        ):
+            await self._reject(
+                signal_id,
+                f"implausible_edge edge={edge:+.2f} mid={mid:.3f}",
+            )
+            return
 
         try:
             decision = await self._risk.evaluate(market, side, implied, confidence)
@@ -201,15 +433,14 @@ class SignalPipeline:
             await self._reject(signal_id, str(rej))
             return
 
-        await self._orders.submit_signal(
-            signal_id=signal_id,
-            market=market,
-            side=side,
-            implied_prob=implied,
-            confidence=confidence,
-            edge=edge,
-            size_usd=decision.size_usd,
-            target_price=decision.target_price,
+        # Signals surface candidates; the three lanes (core.strategies.*)
+        # own entry decisions and size via the allocator. This pipeline
+        # persists the risk-checked size on the signal row for audit but
+        # does not submit any orders — lanes pull their own opportunities
+        # from feed_items / market state directly.
+        await execute(
+            "UPDATE signals SET status=?, size_usd=? WHERE id=?",
+            ("APPROVED", decision.size_usd, signal_id),
         )
 
     @staticmethod
@@ -218,6 +449,30 @@ class SignalPipeline:
             "UPDATE signals SET status=?, reasoning=COALESCE(reasoning,'') || ?  WHERE id=?",
             ("REJECTED", f" | rejected: {reason}", signal_id),
         )
+
+    @staticmethod
+    async def _count_recent_sources(
+        market_id: str, limit: int = 25,
+    ) -> tuple[int, float]:
+        """Distinct feed sources that recently tagged this market,
+        returned as ``(raw_count, weighted_count)``. The weighted
+        count sums per-source ``trust_weight`` from the nightly
+        source_trust calibration — a well-calibrated source counts
+        for more than a noisy one. Missing sources fall back to 1.0
+        so pre-calibration behaviour is unchanged.
+
+        Used by the hallucination guard on low-mid markets."""
+        rows = await fetch_all(
+            """SELECT DISTINCT source FROM feed_items
+               WHERE meta LIKE ?
+               ORDER BY ingested_at DESC LIMIT ?""",
+            (f'%"linked_market_id":%"{market_id}"%', limit),
+        )
+        sources = {r["source"] for r in rows if r["source"]}
+        raw = len(sources)
+        weights = await get_source_weights()
+        weighted = sum(trust_weight_for(s, weights) for s in sources)
+        return raw, weighted
 
 
 def _decode_meta(raw: Any) -> dict[str, Any]:

@@ -1,36 +1,73 @@
 {% extends "base.html" %}
 {% block content %}
+
+{% if enrichment %}
+<section class="stats-row">
+  <div class="stat">
+    <div class="stat__label">ITEMS 24H</div>
+    <div class="stat__val">{{ enrichment.total }}</div>
+    <div class="stat__sub">ingested across all feeds</div>
+  </div>
+  <div class="stat">
+    <div class="stat__label">ENRICHED 24H</div>
+    <div class="stat__val">{{ enrichment.enriched }}</div>
+    <div class="stat__sub">ollama classified</div>
+  </div>
+  <div class="stat">
+    <div class="stat__label">HIGH RELEVANCE</div>
+    <div class="stat__val">{{ enrichment.high_rel }}</div>
+    <div class="stat__sub">market_relevance &ge; 0.5</div>
+  </div>
+  <div class="stat {{ 'stat--bad' if enrichment.backlog > 500 else '' }}">
+    <div class="stat__label">ENRICH BACKLOG</div>
+    <div class="stat__val">{{ enrichment.backlog }}</div>
+    <div class="stat__sub">rows awaiting classification</div>
+  </div>
+</section>
+{% endif %}
+
 <div class="card wide">
-  <h2>Data sources</h2>
+  <h2>DATA SOURCES // ingestion</h2>
   <p class="muted">
-    Per-feed ingestion stats. "Last hour" counts items added in the
-    last 60 minutes; "Last fetch" is the most recent ingested_at across
-    all items from that source.
+    Every feed the bot polls — RSS wire + crypto + topical aggregators + community.
+    "last hour" = items added in the last 60m. "last fetch" = most recent ingested_at
+    from that source. "trust" = weight applied to enrichment scoring
+    (0 = low signal, 1 = tier-1 wire).
   </p>
-  <table>
+  <table class="dense">
     <thead>
       <tr>
-        <th>Source</th>
-        <th>Total items</th>
-        <th>Last hour</th>
-        <th>Last fetch</th>
-        <th>Status</th>
+        <th>source</th>
+        <th>kind</th>
+        <th>trust</th>
+        <th>total items</th>
+        <th>last hour</th>
+        <th>last fetch</th>
+        <th>status</th>
       </tr>
     </thead>
     <tbody>
     {% for s in sources %}
       <tr>
         <td><code>{{ s.source }}</code></td>
+        <td class="muted">{{ s.kind or '' }}</td>
+        <td>
+          {% if s.weight is not none %}
+            {{ '%.2f'|format(s.weight) }}
+          {% else %}
+            <span class="muted">—</span>
+          {% endif %}
+        </td>
         <td>{{ s.total }}</td>
         <td>{{ s.last_hour }}</td>
-        <td>{{ s.last_fetch_human }}</td>
+        <td class="muted">{{ s.last_fetch_human }}</td>
         <td>
           {% if s.status == 'active' %}
-            <span class="ok">active</span>
+            <span class="status status--open">&#9679; ACTIVE</span>
           {% elif s.status == 'idle' %}
-            <span class="warn">idle ({{ s.last_fetch_human }})</span>
+            <span class="status status--pending_fill">&#9679; IDLE</span>
           {% else %}
-            <span class="err">no data</span>
+            <span class="status status--paused">&#9679; NO DATA</span>
           {% endif %}
         </td>
       </tr>
@@ -40,46 +77,45 @@
 </div>
 
 <div class="card wide">
-  <h2>Cross-references (PredictIt vs Polymarket)</h2>
+  <h2>CROSS-REFERENCES // PredictIt vs Polymarket</h2>
   <p class="muted">
-    Recent divergences between PredictIt contract prices and the
-    matched Polymarket question's mid. Sorted by divergence; the
-    largest gaps are the ones the signal pipeline auto-promotes into
-    a feed_item when above the configured threshold.
+    divergences between PredictIt contract prices and the matched Polymarket
+    question's mid. largest gaps are auto-promoted into feed_item above the
+    configured threshold.
   </p>
   {% if xrefs %}
-  <table>
+  <table class="dense">
     <thead>
       <tr>
-        <th>Polymarket</th>
-        <th>PredictIt contract</th>
-        <th>PI price</th>
-        <th>Poly mid</th>
-        <th>Divergence</th>
-        <th>Fetched</th>
+        <th>polymarket</th>
+        <th>predictit contract</th>
+        <th>pi price</th>
+        <th>poly mid</th>
+        <th>divergence</th>
+        <th>fetched</th>
       </tr>
     </thead>
     <tbody>
     {% for x in xrefs %}
       <tr>
-        <td>
+        <td class="q">
           {% if x.question %}
             {{ x.question[:70] }}
           {% else %}
-            <code>{{ (x.polymarket_id or '')[:14] }}...</code>
+            <code>{{ (x.polymarket_id or '')[:14] }}…</code>
           {% endif %}
         </td>
         <td>{{ (x.source_market_name or '')[:60] }}</td>
         <td>{{ '%.3f'|format(x.source_price or 0) }}</td>
         <td>{{ '%.3f'|format(x.poly_price or 0) }}</td>
-        <td>{{ '%.3f'|format(x.divergence or 0) }}</td>
-        <td>{{ x.fetched_human }}</td>
+        <td class="{{ 'ok' if (x.divergence or 0) > 0.05 else 'muted' }}">{{ '%+.3f'|format(x.divergence or 0) }}</td>
+        <td class="muted">{{ x.fetched_human }}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
   {% else %}
-    <p class="muted">No cross-references recorded yet.</p>
+    <p class="muted">no cross-references recorded yet.</p>
   {% endif %}
 </div>
 {% endblock %}

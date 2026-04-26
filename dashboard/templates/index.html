@@ -1,16 +1,53 @@
 {% extends "base.html" %}
 {% block content %}
+
+<section class="stats-row">
+  <div class="stat stat--shadow">
+    <div class="stat__label">SHADOW // exposure</div>
+    <div class="stat__val">${{ '%.2f'|format(exposure_shadow) }}</div>
+    <div class="stat__sub">
+      PnL total <b>${{ '%+.2f'|format(realized_pnl_shadow) }}</b> &middot;
+      24h <b>${{ '%+.2f'|format(daily_pnl_shadow) }}</b>
+    </div>
+  </div>
+  <div class="stat stat--real">
+    <div class="stat__label">REAL // exposure</div>
+    <div class="stat__val">${{ '%.2f'|format(exposure_real) }}</div>
+    <div class="stat__sub">
+      PnL total <b>${{ '%+.2f'|format(realized_pnl_real) }}</b> &middot;
+      24h <b>${{ '%+.2f'|format(daily_pnl_real) }}</b>
+    </div>
+  </div>
+  <div class="stat stat--budget">
+    <div class="stat__label">BUDGETS</div>
+    <div class="stat__val">${{ '%.0f'|format(shadow_total + real_total) }}</div>
+    <div class="stat__sub">
+      shadow ${{ '%.0f'|format(shadow_total) }} &middot;
+      real ${{ '%.0f'|format(real_total) }}
+      &middot; <a href="/settings">edit</a>
+    </div>
+  </div>
+  <div class="stat stat--positions">
+    <div class="stat__label">OPEN POSITIONS</div>
+    <div class="stat__val">{{ positions|length }}</div>
+    <div class="stat__sub">
+      mode <b>{{ mode | upper }}</b> &middot;
+      clob <b class="{{ 'ok' if clob_ready else 'bad' }}">{{ 'ready' if clob_ready else 'off' }}</b>
+    </div>
+  </div>
+</section>
+
 <section class="grid">
   <div class="card">
-    <h2>Health</h2>
-    <table>
-      <thead><tr><th>Component</th><th>Status</th><th>Detail</th></tr></thead>
+    <h2>SYSTEM HEALTH</h2>
+    <table class="dense">
+      <thead><tr><th>component</th><th>state</th><th>detail</th></tr></thead>
       <tbody>
       {% for name, h in health.items() %}
         <tr>
           <td>{{ name }}</td>
           <td class="{{ 'ok' if h.ok else 'bad' }}">{{ 'OK' if h.ok else 'DOWN' }}</td>
-          <td><code>{{ h.detail }}</code></td>
+          <td class="muted"><code>{{ h.detail }}</code></td>
         </tr>
       {% endfor %}
       </tbody>
@@ -18,59 +55,61 @@
   </div>
 
   <div class="card">
-    <h2>PnL</h2>
-    <ul class="kv">
-      <li><span>Open exposure</span><b>${{ '%.2f'|format(exposure) }}</b></li>
-      <li><span>Realised PnL (all)</span><b>${{ '%.2f'|format(realized_pnl) }}</b></li>
-      <li><span>Realised PnL (24h)</span><b>${{ '%.2f'|format(daily_pnl) }}</b></li>
-      <li><span>Open positions</span><b>{{ positions|length }}</b></li>
-    </ul>
-  </div>
-
-  <div class="card kill-switch">
-    <h2>Kill Switch</h2>
-    <p>Live trading is currently <b>{{ 'ON' if live_enabled else 'OFF' }}</b>.</p>
-    <form action="/kill-switch" method="post">
-      {% if live_enabled %}
-        <input type="hidden" name="enabled" value="false">
-        <button type="submit" class="danger">Disable live trading</button>
+    <h2>MODE CONTROL</h2>
+    <p class="muted">Current mode: <b class="mode-pill mode-pill--{{ mode }}">{{ mode | upper }}</b></p>
+    <form action="/mode" method="post" class="inline-form">
+      {% if mode == 'shadow' %}
+        <input type="hidden" name="mode" value="real">
+        <label class="chk">
+          <input type="checkbox" name="confirm" value="CONFIRM" required>
+          I understand this routes to real wallet
+        </label>
+        <button type="submit" class="danger" {% if not clob_ready or real_total <= 0 %}disabled{% endif %}>
+          ACTIVATE REAL
+        </button>
+        {% if not clob_ready %}<p class="hint bad">CLOB client not ready &mdash; check secrets on /settings</p>{% endif %}
+        {% if real_total <= 0 %}<p class="hint bad">real_capital.total_usd is 0 &mdash; set a budget first</p>{% endif %}
       {% else %}
-        <input type="hidden" name="enabled" value="true">
-        <button type="submit">Enable live trading</button>
+        <input type="hidden" name="mode" value="shadow">
+        <button type="submit">RETURN TO SHADOW</button>
+        <p class="hint">stops new real orders; open real positions continue until they close</p>
       {% endif %}
-      <p class="hint">dry_run must also be false in config.yaml.</p>
     </form>
   </div>
 
+  <div class="card">
+    <h2>EQUITY TAPE</h2>
+    {% if equity_points %}
+      <pre class="ascii-chart">{% for ts, pnl in equity_points -%}
+{{ '%+7.2f'|format(pnl) }}
+{% endfor %}</pre>
+    {% else %}<p class="muted">no closed positions yet.</p>{% endif %}
+  </div>
+
   <div class="card wide">
-    <h2>Open positions</h2>
+    <h2>OPEN POSITIONS // {{ positions|length }}</h2>
     {% if positions %}
-    <table>
-      <thead><tr><th>Market</th><th>Side</th><th>Size</th><th>Avg price</th><th>Realised PnL</th></tr></thead>
+    <table class="dense">
+      <thead><tr>
+        <th>lane</th><th>mode</th><th>market</th><th>side</th>
+        <th>size</th><th>entry</th><th>realized</th><th>status</th>
+      </tr></thead>
       <tbody>
       {% for p in positions %}
         <tr>
-          <td><code>{{ p.market_id[:14] }}...</code></td>
-          <td>{{ p.side }}</td>
-          <td>{{ '%.4f'|format(p.size) }}</td>
+          <td>{{ p.lane }}</td>
+          <td><span class="tag tag--{{ 'real' if p.is_real else 'shadow' }}">{{ 'REAL' if p.is_real else 'SHD' }}</span></td>
+          <td><code>{{ p.market_id[:18] }}…</code></td>
+          <td class="{{ 'side-buy' if p.side == 'BUY' else 'side-sell' }}">{{ p.side }}</td>
+          <td>{{ '%.2f'|format(p.size) }}</td>
           <td>{{ '%.3f'|format(p.avg_price) }}</td>
-          <td>${{ '%.2f'|format(p.realized_pnl_usd) }}</td>
+          <td>${{ '%+.2f'|format(p.realized_pnl_usd) }}</td>
+          <td><span class="status status--{{ p.status|lower }}">{{ p.status }}</span></td>
         </tr>
       {% endfor %}
       </tbody>
     </table>
-    {% else %}<p>No open positions.</p>{% endif %}
-  </div>
-
-  <div class="card wide">
-    <h2>Equity curve</h2>
-    {% if equity_points %}
-    <pre class="ascii-chart">
-{% for ts, pnl in equity_points -%}
-{{ '%.2f'|format(pnl) }}
-{% endfor %}
-    </pre>
-    {% else %}<p>No data yet.</p>{% endif %}
+    {% else %}<p class="muted">no open positions. the bot is watching.</p>{% endif %}
   </div>
 </section>
 {% endblock %}

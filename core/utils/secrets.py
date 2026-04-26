@@ -38,8 +38,6 @@ EDITABLE_KEYS: list[tuple[str, str, bool, str]] = [
      "Model tag to use for signal generation. Run `ollama pull <name>` first."),
     ("FRED_API_KEY", "FRED API key", True,
      "Free key from https://fred.stlouisfed.org/docs/api/api_key.html — enables the FRED feed."),
-    ("CRYPTOPANIC_API_TOKEN", "CryptoPanic API token", True,
-     "Optional but recommended. Free token from https://cryptopanic.com/developers/api/ — lifts the public-mode rate limit on the crypto news feed."),
     ("POLY_FUNDER_ADDRESS", "Polymarket funder address", False,
      "Public wallet address that funds CLOB orders. Required for live trading."),
     ("POLY_PRIVATE_KEY", "Polymarket private key", True,

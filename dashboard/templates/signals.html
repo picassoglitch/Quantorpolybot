@@ -1,28 +1,47 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="card wide">
-  <h2>Recent signals</h2>
-  <table>
+<div class="card wide card--tape">
+  <h2>SIGNAL FEED // {{ rows|length }}</h2>
+  <p class="muted small">
+    Status legend:
+    <b>PENDING</b> awaiting scoring ·
+    <b>APPROVED</b> passed all filters ·
+    <b>REJECTED</b> failed a filter ·
+    <b>COOLDOWN</b> market recently signalled (throttled) ·
+    <b>NO MATCH</b> news item didn't match any market ·
+    <b>LOW EDGE</b> edge below min threshold ·
+    <b>IMPLAUSIBLE</b> edge too large at a tail price ·
+    <b>STALE MKT</b> market data too old ·
+    <b>DUPLICATE</b> signal already seen ·
+    <b>TOO FAR</b> all candidate markets resolve beyond max horizon.
+    A dash (—) means the field wasn't scored for this row.
+  </p>
+  <table class="dense">
     <thead>
       <tr>
-        <th>When</th><th>Question</th><th>Side</th>
-        <th>Implied</th><th>Mid</th><th>Edge</th>
-        <th>Conf</th><th>Size $</th><th>Status</th><th>Reasoning</th>
+        <th>time</th><th>question</th><th>side</th>
+        <th>implied</th><th>mid</th><th>edge</th>
+        <th>conf</th><th>size $</th><th>status</th><th>reasoning</th>
       </tr>
     </thead>
     <tbody>
     {% for r in rows %}
+      {% set skipped = r.status | prescore_reject %}
       <tr>
-        <td><small>{{ '%.0f'|format(r.created_at or 0) }}</small></td>
-        <td>{{ (r.question or '')[:60] }}</td>
-        <td>{{ r.side }}</td>
-        <td>{{ '%.3f'|format(r.implied_prob or 0) }}</td>
-        <td>{{ '%.3f'|format(r.mid_price or 0) }}</td>
-        <td>{{ '%+.3f'|format(r.edge or 0) }}</td>
-        <td>{{ '%.2f'|format(r.confidence or 0) }}</td>
-        <td>${{ '%.2f'|format(r.size_usd or 0) }}</td>
-        <td>{{ r.status }}</td>
-        <td><small>{{ (r.reasoning or '')[:120] }}</small></td>
+        <td class="muted">{{ r.created_at | datetimefmt }}</td>
+        <td class="q">{{ (r.question or '')[:80] }}</td>
+        <td class="{{ 'side-buy' if r.side == 'BUY' else ('side-sell' if r.side == 'SELL' else 'muted') }}">
+          {{ r.side or '—' }}
+        </td>
+        <td>{% if skipped %}—{% else %}{{ '%.3f'|format(r.implied_prob or 0) }}{% endif %}</td>
+        <td>{% if skipped %}—{% else %}{{ '%.3f'|format(r.mid_price or 0) }}{% endif %}</td>
+        <td class="{% if skipped %}muted{% elif (r.edge or 0) > 0 %}ok{% else %}bad{% endif %}">
+          {% if skipped %}—{% else %}{{ '%+.3f'|format(r.edge or 0) }}{% endif %}
+        </td>
+        <td>{% if skipped %}—{% else %}{{ '%.2f'|format(r.confidence or 0) }}{% endif %}</td>
+        <td>{% if skipped %}—{% else %}${{ '%.2f'|format(r.size_usd or 0) }}{% endif %}</td>
+        <td><span class="status status--{{ (r.status or 'pending')|lower }}">{{ r.status | signalstatus }}</span></td>
+        <td class="muted">{{ (r.reasoning or '')[:120] }}</td>
       </tr>
     {% endfor %}
     </tbody>

@@ -11,10 +11,10 @@ from core.utils.db import fetch_all
 
 async def category_exposure_usd() -> dict[str, float]:
     rows = await fetch_all(
-        """SELECT m.category AS category, SUM(ABS(p.size * p.avg_price)) AS exposure
-           FROM positions p
+        """SELECT m.category AS category, SUM(p.size_usd) AS exposure
+           FROM shadow_positions p
            JOIN markets m ON m.market_id = p.market_id
-           WHERE p.status='OPEN'
+           WHERE p.status IN ('OPEN','PENDING_FILL')
            GROUP BY m.category"""
     )
     return {(r["category"] or "uncategorised"): float(r["exposure"] or 0.0) for r in rows}
