@@ -430,6 +430,56 @@ SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_event_candidates_event ON event_market_candidates(event_id)",
     "CREATE INDEX IF NOT EXISTS idx_event_candidates_market ON event_market_candidates(market_id, considered_at)",
     "CREATE INDEX IF NOT EXISTS idx_event_candidates_considered ON event_market_candidates(considered_at)",
+    # ---- Pattern Discovery Engine PR #1 ----
+    # `signal_outcomes` is the read-only analytics table. It is
+    # REBUILT by `scripts/analyze_patterns.py --rebuild` from the
+    # candidate-producing tables (event_market_candidates, scan_skips,
+    # shadow_positions) joined against price_ticks for the
+    # "price-after-N-min" forensics.
+    #
+    # One row per (candidate_row, contributing_source) pair — events
+    # with multiple sources fan out to N rows so source_performance
+    # aggregations can score each source independently. The
+    # `source_table` + `source_row_id` columns let us trace a row
+    # back to its origin without a JSON-path extract.
+    #
+    # Nothing in the live trading path writes to this table; the bot
+    # never reads it. It exists purely for offline analysis and the
+    # CLI's report output.
+    """
+    CREATE TABLE IF NOT EXISTS signal_outcomes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rebuilt_at REAL,
+        source_table TEXT,
+        source_row_id INTEGER,
+        detected_at REAL,
+        source TEXT,
+        category TEXT,
+        market_id TEXT,
+        token_id TEXT,
+        snapshot_price REAL,
+        snapshot_taken_at REAL,
+        price_after_1m REAL,
+        price_after_5m REAL,
+        price_after_15m REAL,
+        price_after_1h REAL,
+        max_favorable_move_15m REAL,
+        max_adverse_move_15m REAL,
+        whether_market_moved INTEGER,
+        direction_correct INTEGER,
+        estimated_edge_captured REAL,
+        estimated_edge_missed REAL,
+        side TEXT,
+        final_status TEXT,
+        reject_reason TEXT,
+        polarity_source TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_source ON signal_outcomes(source)",
+    "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_category ON signal_outcomes(category)",
+    "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_status_detected ON signal_outcomes(final_status, detected_at)",
+    "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_market_detected ON signal_outcomes(market_id, detected_at)",
+    "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_rebuilt ON signal_outcomes(rebuilt_at)",
 ]
 
 
