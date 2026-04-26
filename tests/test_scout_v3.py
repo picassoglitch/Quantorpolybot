@@ -84,45 +84,54 @@ def temp_db(tmp_path, monkeypatch):
 
 
 # ============================================================
-# 1. Observed thresholds lowered to 0.50 / 0.25
+# 1. Observed thresholds — v3.1: lowered to 0.35 / 0.20
 # ============================================================
 
 
 def test_observed_thresholds_lowered_to_v3_values():
-    """Pin the constants so a future change is reviewed deliberately."""
-    assert _OBSERVED_MIN_SEVERITY == 0.50
-    assert _OBSERVED_MIN_MATCH_SCORE == 0.25
+    """Pin the constants so a future change is reviewed deliberately.
+
+    v3.0 was 0.50 / 0.25; v3.1 lowered to 0.35 / 0.20 because
+    single-source GDELT events from tier-3 domains cap their
+    severity at ~0.38 (SHOOTING) / ~0.45 (ASSASSINATION_ATTEMPT).
+    The v3.0 floor was unreachable for these in practice, so the
+    lane silently dropped exactly the kind of imperfect-information-
+    early signal the scout exists for.
+    """
+    assert _OBSERVED_MIN_SEVERITY == 0.35
+    assert _OBSERVED_MIN_MATCH_SCORE == 0.20
 
 
 def test_observed_fires_at_new_severity_floor():
-    """sev=0.50 (exact threshold) + match=0.30 should trigger
-    observed-mode under v3 thresholds. Under v2 (0.60/0.30) it
-    would have rejected as polarity_unknown."""
+    """Single-source tier-3 GDELT events cap at severity ~0.38 for
+    SHOOTING. The v3.1 threshold (0.35) catches them; the v3.0
+    threshold (0.50) and earlier did not."""
     market = _market("Will candidate X win the Q3 primary?")
     impact = score_impact(
-        _event(EventCategory.ELECTION_RESULT, severity=0.50),
-        _match(market, score=0.30),
+        _event(EventCategory.ELECTION_RESULT, severity=0.38),
+        _match(market, score=0.25),
     )
     assert impact.observed is True
     assert impact.confidence > 0.0
 
 
 def test_observed_fires_at_new_match_score_floor():
-    """sev=0.60 + match=0.25 should trigger observed-mode under v3
-    thresholds (was below the v2 0.30 floor)."""
+    """sev=0.50 + match=0.20 should trigger observed-mode under
+    v3.1 (0.35 / 0.20). Under v3.0 (0.50 / 0.25) the match would
+    have been below the floor."""
     market = _market("Will candidate X win?")
     impact = score_impact(
-        _event(EventCategory.ELECTION_RESULT, severity=0.60),
-        _match(market, score=0.25),
+        _event(EventCategory.ELECTION_RESULT, severity=0.50),
+        _match(market, score=0.20),
     )
     assert impact.observed is True
 
 
 def test_observed_does_not_fire_below_new_thresholds():
-    """sev=0.49 should still NOT trigger observed-mode."""
+    """Below v3.1 thresholds (sev=0.30 < 0.35) → still NOT observed."""
     market = _market("Will candidate X win?")
     impact = score_impact(
-        _event(EventCategory.ELECTION_RESULT, severity=0.49),
+        _event(EventCategory.ELECTION_RESULT, severity=0.30),
         _match(market, score=0.30),
     )
     assert impact.observed is False
@@ -142,9 +151,11 @@ def test_polarity_source_rules_when_rule_matches():
 
 
 def test_polarity_source_none_when_polarity_unknown():
+    """severity 0.30 < 0.35 (v3.1 floor) AND no polarity rule for
+    ELECTION_RESULT → polarity_source 'none', no observed-mode."""
     market = _market("Will candidate X win?")
     impact = score_impact(
-        _event(EventCategory.ELECTION_RESULT, severity=0.49),
+        _event(EventCategory.ELECTION_RESULT, severity=0.30),
         _match(market, score=0.30),
     )
     assert impact.direction == 0

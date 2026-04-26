@@ -80,8 +80,23 @@ _HEURISTIC_CONFIDENCE_CAP = 0.55
 # — the previous 0.60/0.30 was too strict against the corpus we're
 # actually seeing from GDELT. Lowering doesn't loosen safety; observed
 # candidates STILL don't trade (confidence stays below the trade gate).
-_OBSERVED_MIN_SEVERITY = 0.50
-_OBSERVED_MIN_MATCH_SCORE = 0.25
+#
+# v3.1 (2026-04-26 soak): lowered AGAIN. The normalizer multiplies
+# the per-category base severity by a confidence multiplier
+# (max(0.4, mean_confidence)). For single-source GDELT events from
+# tier-3 domains (confidence=0.45), severity caps at:
+#
+#   SHOOTING:           0.85 * 1.0 * 0.45 = 0.38
+#   ASSASSINATION:      1.00 * 1.0 * 0.45 = 0.45
+#   WAR_ESCALATION:     0.90 * 1.0 * 0.45 = 0.41
+#
+# The 0.50 floor was unreachable for these. Live soak (PR #9 merged)
+# showed every single-source SHOOTING event being silently dropped
+# despite being exactly the kind of "imperfect-information-early"
+# signal the scout exists for. 0.35 catches the realistic single-
+# source band; observed candidates STILL don't trade.
+_OBSERVED_MIN_SEVERITY = 0.35
+_OBSERVED_MIN_MATCH_SCORE = 0.20
 _OBSERVED_CONFIDENCE = 0.20  # Below the 0.40 trade gate, above 0.0
 
 

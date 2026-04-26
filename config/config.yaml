@@ -301,12 +301,27 @@ breaking_event_scout:
   max_position_usd: 3.0
   # ---- v3: high-severity-solo corroboration override ----
   # When source_count==1 AND no primary source is present BUT
-  # event.severity is very high (>= threshold), allow the candidate
-  # through corroboration but apply a reduced size multiplier to
-  # compensate for the lower confidence. Cooldown / max-exposure /
-  # edge / spread / age safety checks STILL run normally — this is
-  # sizing-only.
-  high_sev_solo_threshold: 0.80
+  # event.severity is high enough (>= threshold), allow the
+  # candidate through corroboration but apply a reduced size
+  # multiplier to compensate for the lower confidence. Cooldown /
+  # max-exposure / edge / spread / age safety checks STILL run
+  # normally — this is corroboration-only.
+  #
+  # Threshold tuning history:
+  #   v3.0 (initial):  0.80 — UNREACHABLE for single-source
+  #     non-primary events. Normalizer caps single-source severity
+  #     at base_category × max(0.4, mean_confidence). Tier-3 GDELT
+  #     events (confidence=0.45) max out at 0.38 for SHOOTING and
+  #     0.45 for ASSASSINATION_ATTEMPT. Live soak after PR #9
+  #     showed every single-source SHOOTING getting rejected on
+  #     corroboration — exactly the early-imperfect-information
+  #     signal the scout was supposed to capture.
+  #   v3.1 (2026-04-26): 0.35 — catches the realistic
+  #     single-source band. Operator can re-tighten via this
+  #     config key if false-positive count grows in the audit
+  #     trail (event_market_candidates with status=accepted +
+  #     small post-N-min move).
+  high_sev_solo_threshold: 0.35
   high_sev_solo_size_multiplier: 0.30
   # ---- v3: LLM polarity inference ----
   # When rules can't resolve direction AND event.severity is high
