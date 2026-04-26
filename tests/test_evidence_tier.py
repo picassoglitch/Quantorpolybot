@@ -202,6 +202,65 @@ async def test_watchlist_flag_persists_as_one(temp_db):
 
 
 @pytest.mark.asyncio
+async def test_score_snapshot_round_trips_pattern_engine_fields(temp_db):
+    """Pattern Discovery layer (roadmap) needs the lane to persist
+    enough per-skip data that a future analytics job can recompute
+    "price-after-N-min" and source attribution without any schema
+    migration. This test pins the JSON payload shape to that contract.
+    """
+    payload = {
+        "market": {
+            "mid": 0.42,
+            "best_bid": 0.41,
+            "best_ask": 0.43,
+            "spread_cents": 2.0,
+            "liquidity": 25_000.0,
+            "yes_token": "yes-token-abc",
+        },
+        "evidence": {
+            "sources": ["rss:bbc", "polymarket_news"],
+            "evidence_ids": [101, 102, 103],
+            "item_count": 3,
+        },
+        "true_prob": 0.55,
+        "confidence": 0.62,
+        "source": "ollama",
+        "edge": 0.13,
+        "vol_24h": 35_000.0,
+    }
+    await record_skip(
+        lane="scalping",
+        market_id="m-7",
+        tier_attempted="strong",
+        reject_reason="edge 0.130 < 0.150",
+        evidence_tier="strong",
+        watchlist=False,
+        score_snapshot=payload,
+    )
+    row = await db_module.fetch_one(
+        "SELECT score_snapshot FROM scan_skips WHERE market_id=?", ("m-7",),
+    )
+    assert row is not None
+    import json as _json
+    decoded = _json.loads(row["score_snapshot"])
+
+    # Three required top-level blocks for the pattern engine.
+    assert "market" in decoded and "evidence" in decoded
+    # Market block must carry the JOIN key (yes_token) and the
+    # snapshot fields the analytics job won't get from price_ticks.
+    assert decoded["market"]["yes_token"] == "yes-token-abc"
+    assert decoded["market"]["mid"] == 0.42
+    assert decoded["market"]["spread_cents"] == 2.0
+    # Evidence block enables source-attribution joins. Sorted set of
+    # source names + the feed_item ids the lane actually looked at.
+    assert decoded["evidence"]["sources"] == ["rss:bbc", "polymarket_news"]
+    assert decoded["evidence"]["evidence_ids"] == [101, 102, 103]
+    # Branch-specific extras flow through unchanged.
+    assert decoded["confidence"] == 0.62
+    assert decoded["edge"] == 0.13
+
+
+@pytest.mark.asyncio
 async def test_purge_removes_old_rows_only(temp_db):
     now = time.time()
     # Old row: 10 days ago.

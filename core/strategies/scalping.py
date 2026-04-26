@@ -4,6 +4,20 @@ Catch small mispricings on liquid markets, exit fast. Liquidity is the
 core filter here — no illiquid markets, no wide spreads, no stale
 prices. Exits trigger on PnL thresholds, spread widening, position age,
 or a conviction flip from the Ollama re-score.
+
+Persistence note (forward-pointer for the planned Signal Quality +
+Pattern Discovery layer):
+
+  Every skip writes a `scan_skips` row whose `score_snapshot` JSON
+  bundles three blocks: `market` (mid, spread, token, liquidity at
+  scan time), `evidence` (sources, feed_item ids, count), and
+  branch-specific `extras` (score, edge, vol_24h, microstructure
+  components, etc.). Combined with `scan_skips.scan_ts` and the
+  `price_ticks` index on `(market_id, ts)`, a future analytics job
+  can compute "price-after-1m/5m/15m/1h" for every signal the lane
+  saw, partitioned by source / tier / reject reason — without any
+  schema migration. See ROADMAP item: Signal Quality + Pattern
+  Discovery.
 """
 
 from __future__ import annotations
@@ -191,25 +205,75 @@ class ScalpingLane:
         low_edge = 0
         entered = 0
 
+        def _market_snapshot(market: Any) -> dict[str, Any]:
+            """Forward-pointer for the planned Signal Quality + Pattern
+            Discovery layer: the pattern engine needs the market's
+            mid/spread/token at the moment of the decision, plus
+            something to JOIN against `price_ticks` for "price after
+            N minutes" calculations. Captured per-skip in
+            `score_snapshot` so we don't need a schema change later.
+            Cheap — six floats and one string per row.
+            """
+            return {
+                "mid": market.mid,
+                "best_bid": market.best_bid,
+                "best_ask": market.best_ask,
+                "spread_cents": (market.best_ask - market.best_bid) * 100.0,
+                "liquidity": market.liquidity,
+                "yes_token": market.yes_token() or "",
+            }
+
+        def _evidence_snapshot(items: list[dict[str, Any]]) -> dict[str, Any]:
+            """Companion to `_market_snapshot`. Persists the source
+            attribution and feed_item ids so the pattern engine can
+            answer "which sources contributed to this skip?" without
+            having to reconstruct the lane's evidence query against a
+            possibly-rotated feed_items table.
+            """
+            sources = sorted({
+                str(e.get("source")) for e in items if e.get("source")
+            })
+            evidence_ids = [
+                int(e["id"]) for e in items if e.get("id") is not None
+            ]
+            return {
+                "sources": sources,
+                "evidence_ids": evidence_ids,
+                "item_count": len(items),
+            }
+
         async def _persist_skip(
-            market_id: str,
+            market: Any,
             tier_attempted: str,
             reject_reason: str,
             evidence_tier: str,
             *,
             watchlist: bool = False,
-            score_snapshot: dict[str, Any] | None = None,
+            extras: dict[str, Any] | None = None,
+            evidence_items: list[dict[str, Any]] | None = None,
         ) -> None:
             """Local closure — captures scan_ts so every skip in one
-            scan shares the same scan_ts (handy for grouping later)."""
+            scan shares the same scan_ts (handy for grouping later).
+
+            Builds the score_snapshot payload from three sources:
+            `_market_snapshot(market)` (always), `_evidence_snapshot`
+            (when we have it), and `extras` (per-branch score data).
+            Branch-specific extras win on key collision so callers can
+            override e.g. `mid` if they want a more precise value.
+            """
+            payload: dict[str, Any] = {"market": _market_snapshot(market)}
+            if evidence_items is not None:
+                payload["evidence"] = _evidence_snapshot(evidence_items)
+            if extras:
+                payload.update(extras)
             await record_skip(
                 lane=LANE,
-                market_id=market_id,
+                market_id=market.market_id,
                 tier_attempted=tier_attempted,
                 reject_reason=reject_reason,
                 evidence_tier=evidence_tier,
                 watchlist=watchlist,
-                score_snapshot=score_snapshot,
+                score_snapshot=payload,
                 scan_ts=scan_ts,
             )
 
@@ -219,13 +283,13 @@ class ScalpingLane:
             if market.market_id in blocked:
                 skipped["concentration"] = skipped.get("concentration", 0) + 1
                 await _persist_skip(
-                    market.market_id, "pregate", "concentration", "n/a",
+                    market, "pregate", "concentration", "n/a",
                 )
                 continue
             if await shadow.count_open_for_market_in_lane(market.market_id, LANE) > 0:
                 skipped["already_open"] = skipped.get("already_open", 0) + 1
                 await _persist_skip(
-                    market.market_id, "pregate", "already_open", "n/a",
+                    market, "pregate", "already_open", "n/a",
                 )
                 continue
             # Date window already enforced in the pool pre-filter above;
@@ -235,7 +299,7 @@ class ScalpingLane:
             if spread_cents <= 0 or spread_cents > max_spread_cents:
                 skipped["spread"] = skipped.get("spread", 0) + 1
                 await _persist_skip(
-                    market.market_id, "pregate",
+                    market, "pregate",
                     f"spread {spread_cents:.1f}c > {max_spread_cents:.1f}c",
                     "n/a",
                 )
@@ -258,9 +322,11 @@ class ScalpingLane:
             if vol < min_volume:
                 skipped["volume"] = skipped.get("volume", 0) + 1
                 await _persist_skip(
-                    market.market_id, "pregate",
+                    market, "pregate",
                     f"volume {vol:.0f} < {min_volume:.0f}",
                     classification.tier.value,
+                    evidence_items=evidence,
+                    extras={"vol_24h": vol},
                 )
                 continue
 
@@ -330,15 +396,15 @@ class ScalpingLane:
                     skipped["no_evidence_no_microstructure"] = (
                         skipped.get("no_evidence_no_microstructure", 0) + 1
                     )
-                    snapshot: dict[str, Any] | None = None
+                    extras: dict[str, Any] = {"vol_24h": vol}
                     if micro is not None:
-                        snapshot = {
+                        extras.update({
                             "microstructure_strength": micro.strength,
                             "microstructure_direction": micro.direction,
                             "components": micro.components,
-                        }
+                        })
                     await _persist_skip(
-                        market.market_id,
+                        market,
                         EvidenceTier.MICRO.value,
                         (
                             "microstructure: insufficient signal"
@@ -347,7 +413,8 @@ class ScalpingLane:
                         ),
                         EvidenceTier.NONE.value,
                         watchlist=False,
-                        score_snapshot=snapshot,
+                        evidence_items=evidence,
+                        extras=extras,
                     )
                     continue
                 score = scoring.Score(
@@ -367,10 +434,12 @@ class ScalpingLane:
                 # tier=NONE). Skip with the classifier's own reasoning.
                 skipped["no_evidence"] = skipped.get("no_evidence", 0) + 1
                 await _persist_skip(
-                    market.market_id,
+                    market,
                     "n/a",
                     classification.reasoning,
                     classification.tier.value,
+                    evidence_items=evidence,
+                    extras={"vol_24h": vol},
                 )
                 continue
 
@@ -381,15 +450,17 @@ class ScalpingLane:
                 # market that fell short on confidence is still useful
                 # to know about for tuning.
                 await _persist_skip(
-                    market.market_id,
+                    market,
                     tier_label,
                     f"confidence {score.confidence:.2f} < {tier_min_conf:.2f}",
                     classification.tier.value,
                     watchlist=watchlist_flag,
-                    score_snapshot={
+                    evidence_items=evidence,
+                    extras={
                         "true_prob": score.true_prob,
                         "confidence": score.confidence,
                         "source": score.source,
+                        "vol_24h": vol,
                     },
                 )
                 continue
@@ -397,17 +468,18 @@ class ScalpingLane:
             if abs(edge) < min_edge:
                 low_edge += 1
                 await _persist_skip(
-                    market.market_id,
+                    market,
                     tier_label,
                     f"edge {abs(edge):.3f} < {min_edge:.3f}",
                     classification.tier.value,
                     watchlist=watchlist_flag,
-                    score_snapshot={
+                    evidence_items=evidence,
+                    extras={
                         "true_prob": score.true_prob,
                         "confidence": score.confidence,
                         "source": score.source,
                         "edge": edge,
-                        "mid": market.mid,
+                        "vol_24h": vol,
                     },
                 )
                 continue
@@ -423,11 +495,19 @@ class ScalpingLane:
             if approved is None:
                 skipped["budget"] = skipped.get("budget", 0) + 1
                 await _persist_skip(
-                    market.market_id,
+                    market,
                     tier_label,
                     f"budget rejected wanted={wanted:.2f}",
                     classification.tier.value,
                     watchlist=watchlist_flag,
+                    evidence_items=evidence,
+                    extras={
+                        "true_prob": score.true_prob,
+                        "confidence": score.confidence,
+                        "source": score.source,
+                        "wanted": wanted,
+                        "vol_24h": vol,
+                    },
                 )
                 continue
 
