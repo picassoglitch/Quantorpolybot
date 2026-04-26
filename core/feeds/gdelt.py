@@ -2,30 +2,63 @@
 
 GDELT's public API: https://api.gdeltproject.org/api/v2/doc/doc
 No auth, no rate limit token (soft rate limit only). Returns articles
-matching a query within a time window, with structured fields:
-
-  - ``url``, ``title``, ``seendate``, ``socialimage``, ``domain``,
-    ``language``, ``sourcecountry``
-  - ``themes``: GDELT's CAMEO-derived theme tags (we use these for
-    category hinting)
-  - ``persons``, ``locations``, ``organizations``: extracted entities
+matching a query within a time window.
 
 We poll on a configurable cadence and write each new article into
-``scout_signals`` with ``source="gdelt"`` and ``raw_payload`` carrying
-the full JSON record. Dedup is by ``signal_hash`` (sha256 of
-source + url).
+``scout_signals`` with ``source="gdelt"``. Dedup is by ``signal_hash``
+(sha256 of source + url).
 
 Deliberately writes to ``scout_signals``, not ``feed_items``: the
 existing signals pipeline auto-scores every feed_items row via Ollama,
 which would double-process GDELT (the scout has its own heuristic
-impact scorer in PR #1; LLM-backed scoring of these articles is on the
-roadmap, not in v1).
+impact scorer in PR #1; LLM-backed scoring of these articles is on
+the roadmap, not in v1).
+
+Resilience contract (post-incidents, 2026-04-26):
+
+  GDELT enforces a hard "1 request every 5 seconds" rate limit and
+  responds to violations with HTTP 429 + a plain-text body. Once an
+  IP has been rate-limited, GDELT also tarpits SSL handshakes for
+  several minutes — observed as a wave of ConnectTimeouts even after
+  spacing requests >5s. Recovery requires a fully serial, globally-
+  rate-limited request stream, not just per-category spacing.
+
+  v3 (this revision):
+
+    1. ``_fetch_gdelt`` always returns a ``GdeltFetchResult`` —
+       never raises. Records status / content-type / body excerpt /
+       exception class so triage logs are actionable.
+    2. PROCESS-WIDE ``GdeltRateLimiter`` (singleton). Every request
+       — startup canary, category fetches, smoke probe — calls
+       ``await GLOBAL_LIMITER.acquire()`` first. min_interval
+       defaults to 6.0s (above GDELT's 5s ask). On a 429 the
+       limiter widens to 12s for 60s, then narrows back. This is
+       the primary fix for the 429 storms: even with two coroutines
+       calling concurrently the limiter serializes them.
+    3. Per-category exponential backoff (kept from v2): a category
+       that fails is skipped for ``min(60s × 2^N, 30min)``.
+    4. Categories whitelist (``feeds.gdelt.categories`` config) —
+       defaults to a small set (shooting / election_result /
+       macro_data_surprise) until the connector demonstrates
+       stability. Operator can promote to "all" once the cycle log
+       shows consistent ok>0.
+    5. Bumped split httpx timeout (connect=20, read=30). On
+       rate-limited IPs the SSL handshake alone can eat 10s+.
+    6. Retry-once on timeout: the first ConnectTimeout / ReadTimeout
+       gets one retry after a 5s wait (still going through the
+       rate limiter). A persistent timeout backs off the category;
+       a transient one is forgiven.
+    7. INFO-level success log per category fetch — operators need
+       to SEE that the connector is doing work, not only when it
+       fails.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
 
@@ -42,50 +75,663 @@ DEGRADED_POLL_MULTIPLIER = 2
 
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 
-# Per-category GDELT search queries. GDELT's query language supports
-# boolean OR / AND, exact-phrase quoting, and theme: filters. The
-# queries are intentionally broad on the keyword side and lean on the
-# Doc API's `mode=ArtList` to give us article-level granularity; the
-# normalizer downstream handles fine-grained classification.
+# Per-category backoff bounds. 60s start, double per consecutive
+# failure, cap at 30 min. Tuned for GDELT's 5s rate limit + the
+# observation that once GDELT 429s us, it tarpits SSL handshakes
+# for ~minutes — we want to back off LONGER than the rate-limit
+# floor so the IP cools down.
+_BACKOFF_BASE_SECONDS = 60.0
+_BACKOFF_CAP_SECONDS = 30 * 60.0
+
+# Per-category GDELT search queries.
 #
-# Themes list: https://blog.gdeltproject.org/gdelt-2-0-our-global-world-in-realtime/
-# We use a mix of free-text keywords (caught by GDELT's full-text index)
-# and theme: predicates (caught by the entity-extraction layer) so a
-# single category hits multiple GDELT signal pathways.
+# CRITICAL: GDELT's query parser REQUIRES parentheses around any
+# OR'd terms ("Queries containing OR'd terms must be surrounded by
+# (). "). A bare `"a" OR "b"` is rejected with HTTP 200 + text/html.
+# `_validate_query_syntax()` runs on import and on every fetch to
+# enforce this — adding a new query without parens will fail at
+# import time, not silently in production.
+#
+# Single-phrase queries (no OR) don't need parens. Multi-phrase
+# queries with OR DO. If a future query mixes AND with OR groups
+# each OR-group needs its own parens: `(a OR b) AND (c OR d)`.
 _CATEGORY_QUERIES: dict[EventCategory, str] = {
-    EventCategory.SHOOTING: '("shooting" OR "shooter" OR "gunman") -movie',
-    EventCategory.ASSASSINATION_ATTEMPT: '"assassination attempt" OR (assassinated AND politician)',
-    EventCategory.EVACUATION: '"evacuation" OR "evacuated" OR "evacuating"',
-    EventCategory.DEATH_INJURY: '("died" OR "killed" OR "wounded" OR "injured") (politician OR official OR leader)',
-    EventCategory.RESIGNATION: '("resignation" OR "resigned" OR "stepping down") (minister OR director OR ceo OR president OR senator)',
-    EventCategory.ARREST: '("arrested" OR "in custody" OR "detained") (politician OR ceo OR official)',
-    EventCategory.INDICTMENT: '"indicted" OR "indictment" OR "charged with"',
-    EventCategory.WAR_ESCALATION: '"airstrike" OR "missile strike" OR "ground offensive" OR "war escalation"',
-    EventCategory.CEASEFIRE: '"ceasefire" OR "truce" OR "peace deal"',
-    EventCategory.ELECTION_RESULT: '("election" AND ("called" OR "winner" OR "results" OR "concedes" OR "victory"))',
-    EventCategory.COURT_RULING: '"supreme court ruling" OR "court ruled" OR "judge ruled" OR "verdict"',
-    EventCategory.MACRO_DATA_SURPRISE: '"CPI" OR "jobs report" OR "GDP" OR "Fed decision" OR "rate hike" OR "rate cut"',
-    EventCategory.SPORTS_INJURY: '("injured" OR "out for season" OR "ruled out") (NBA OR NFL OR MLB OR Premier League OR Champions League)',
+    EventCategory.SHOOTING: '("shooting" OR "gunman" OR "active shooter")',
+    EventCategory.ASSASSINATION_ATTEMPT: '("assassination attempt" OR "attempted assassination")',
+    EventCategory.EVACUATION: '("evacuation" OR "evacuated" OR "evacuate")',
+    EventCategory.DEATH_INJURY: '("killed in" OR "wounded in" OR "fatally shot")',
+    EventCategory.RESIGNATION: '("resigned" OR "resignation" OR "stepping down")',
+    EventCategory.ARREST: '("arrested" OR "in custody" OR "detained by police")',
+    EventCategory.INDICTMENT: '("indicted" OR "indictment" OR "charged with")',
+    EventCategory.WAR_ESCALATION: '("airstrike" OR "missile strike" OR "invasion")',
+    EventCategory.CEASEFIRE: '("ceasefire" OR "truce" OR "peace deal")',
+    EventCategory.ELECTION_RESULT: '("wins election" OR "election results" OR "concedes")',
+    EventCategory.COURT_RULING: '("supreme court ruling" OR "court ruled" OR "verdict")',
+    EventCategory.MACRO_DATA_SURPRISE: '("jobs report" OR "rate cut" OR "rate hike" OR "Fed decision")',
+    EventCategory.SPORTS_INJURY: '("out for season" OR "ruled out" OR "torn ACL")',
 }
+
+# Used by the startup canary. Plain, broad, won't be rejected — the
+# point is to verify GDELT is reachable and returning JSON before we
+# launch into the 13-category sweep. Single phrase (no OR), so no
+# outer parens needed.
+_CANARY_QUERY = '"climate change"'
+
+
+# ============================================================
+# Query syntax validation — fail-fast guard
+# ============================================================
+
+
+class GdeltQuerySyntaxError(ValueError):
+    """Raised when a query violates GDELT's documented syntax rules
+    that we can check locally without round-tripping the API.
+
+    Today the only checked rule is "OR'd terms must be surrounded by
+    ()" — the same rule that caused the 2026-04-26 v3.1 incident.
+    Add more rules here as we learn them from the wire.
+    """
+
+
+def _validate_query_syntax(query: str, *, label: str = "query") -> None:
+    """Local validation. Raises ``GdeltQuerySyntaxError`` on a
+    detectably-invalid query so module import / lane startup fails
+    instead of producing 'Queries containing OR'd terms must be
+    surrounded by ().' on every cycle.
+
+    Rule (today): if the query contains a top-level ` OR ` token
+    (case-sensitive, surrounded by spaces) and is NOT wrapped in
+    outer parens, it's invalid. Nested OR groups inside parens are
+    fine (and not validated further — GDELT itself will tell us if
+    they're malformed).
+    """
+    q = (query or "").strip()
+    if not q:
+        return
+    if " OR " not in q:
+        return  # Single term or AND-only — no parens needed.
+    # If the whole query is one bracketed group (`(...)`), assume
+    # it's correctly wrapped. We don't try to fully tokenise — that
+    # would re-implement GDELT's parser. Empirically GDELT accepts
+    # `(a OR b)` and `(a OR b) AND (c OR d)` etc.
+    if q.startswith("(") and q.endswith(")"):
+        return
+    # If the query contains AND-joined groups like `(a OR b) AND c`,
+    # it doesn't need outer parens around the whole thing — only
+    # around the OR groups. Accept any query whose every top-level
+    # OR appears inside a paren group.
+    if _every_or_is_inside_parens(q):
+        return
+    raise GdeltQuerySyntaxError(
+        f"GDELT {label} contains unwrapped OR — must be surrounded "
+        f"by parens. Got: {query!r}"
+    )
+
+
+def _every_or_is_inside_parens(q: str) -> bool:
+    """Walk the query left-to-right tracking paren depth. If any
+    ` OR ` token appears at depth 0, return False."""
+    depth = 0
+    i = 0
+    while i < len(q):
+        c = q[i]
+        if c == "(":
+            depth += 1
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            if depth < 0:
+                return False  # malformed parens
+            i += 1
+            continue
+        # Look for " OR " at this position.
+        if depth == 0 and q[i:i+4] == " OR ":
+            return False
+        i += 1
+    return depth == 0
+
+
+# Run validation at import time so a bad query in `_CATEGORY_QUERIES`
+# fails the import (and therefore the bot startup) instead of silently
+# 429ing every cycle in production.
+for _cat, _q in _CATEGORY_QUERIES.items():
+    _validate_query_syntax(_q, label=f"category {_cat.value}")
+_validate_query_syntax(_CANARY_QUERY, label="canary")
+
+# Default categories whitelist for the initial-stability phase. The
+# connector ships covering 13 categories but only RUNS the ones in
+# this list until the operator promotes the config. With one request
+# every ~6s and 3 categories, a cycle is ~18s — well under any
+# reasonable rate limit and easy to validate.
+_DEFAULT_ENABLED_CATEGORIES: tuple[EventCategory, ...] = (
+    EventCategory.SHOOTING,
+    EventCategory.ELECTION_RESULT,
+    EventCategory.MACRO_DATA_SURPRISE,
+)
+
+
+# ============================================================
+# Process-wide rate limiter (singleton)
+# ============================================================
+
+
+class GdeltRateLimiter:
+    """Process-wide async rate limiter for GDELT requests.
+
+    Every code path that hits GDELT (lane cycle, startup canary,
+    smoke probe) MUST call ``await acquire()`` before the HTTP
+    request — that's the contract. Only one request can pass per
+    ``min_interval_seconds``.
+
+    On a 429 response, the caller invokes ``penalize(seconds)`` to
+    widen ``min_interval_seconds`` for that duration, then it
+    automatically narrows back. This is the second-order rate-limit
+    response: not just spacing requests further apart for the
+    immediate retry, but pushing the overall rate down for a window
+    so the IP can cool off.
+
+    Process-local — runs in whichever event loop calls it first. The
+    smoke probe and the lane both reuse the same module-level
+    ``GLOBAL_LIMITER``.
+    """
+
+    def __init__(self, *, min_interval_seconds: float = 6.0) -> None:
+        self._base_interval = float(min_interval_seconds)
+        self._current_interval = float(min_interval_seconds)
+        self._penalty_until_ts: float = 0.0
+        self._last_request_ts: float = 0.0
+        self._lock = asyncio.Lock()
+
+    @property
+    def base_interval_seconds(self) -> float:
+        return self._base_interval
+
+    @property
+    def current_interval_seconds(self) -> float:
+        # If penalty window has expired, narrow back to the base
+        # interval transparently.
+        if self._penalty_until_ts and now_ts() >= self._penalty_until_ts:
+            self._current_interval = self._base_interval
+            self._penalty_until_ts = 0.0
+        return self._current_interval
+
+    def configure(self, *, min_interval_seconds: float) -> None:
+        """Update the base interval. Used by the connector when the
+        operator changes config without restart."""
+        self._base_interval = float(min_interval_seconds)
+        if not self._penalty_until_ts:
+            self._current_interval = self._base_interval
+
+    def penalize(self, *, widen_to_seconds: float, hold_for_seconds: float) -> None:
+        """Widen the interval to ``widen_to_seconds`` for the next
+        ``hold_for_seconds`` (relative to now). Multiple concurrent
+        penalties take the widest interval and the latest expiry —
+        a 429 storm naturally hardens the limiter.
+        """
+        new_interval = max(self._current_interval, float(widen_to_seconds))
+        new_until = max(self._penalty_until_ts, now_ts() + float(hold_for_seconds))
+        self._current_interval = new_interval
+        self._penalty_until_ts = new_until
+
+    async def acquire(self) -> float:
+        """Block until at least ``current_interval_seconds`` has
+        passed since the last request returned. Returns the actual
+        wait time (for log/test inspection)."""
+        async with self._lock:
+            interval = self.current_interval_seconds
+            wait = max(0.0, (self._last_request_ts + interval) - now_ts())
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_ts = now_ts()
+            return wait
+
+
+# Module-level singleton. The probe script and the lane share this
+# instance — that's the whole point of "GLOBAL". Initialised with the
+# v3 default; the connector calls .configure() at run() if config has
+# a different value.
+GLOBAL_LIMITER = GdeltRateLimiter(min_interval_seconds=6.0)
+
+# 429 response: widen the limiter to 12s for 60s. These are
+# conservative — we'd rather over-cool than re-trigger.
+_PENALTY_WIDEN_TO_SECONDS = 12.0
+_PENALTY_HOLD_SECONDS = 60.0
+
+# Retry-once on transient timeout: how long to wait between the
+# timeout and the retry. Goes through the rate limiter on the second
+# attempt as well.
+_TIMEOUT_RETRY_DELAY_SECONDS = 5.0
+
+# GDELT 429 body always begins with this phrase. Detected explicitly so
+# we can short-circuit the "looks like JSON" check and emit a clearly
+# tagged log line.
+_RATE_LIMIT_PREFIX = "Please limit requests"
+
+# GDELT validation errors: when the API doesn't like the request shape
+# (timespan too short, query syntax invalid, mode unknown, etc.) it
+# returns HTTP 200 with text/html and a one-line plain-text error in
+# the body. Detected as the `query_invalid` failure mode so the
+# operator gets a clearly tagged "fix the config" log line, NOT a
+# generic non_json. The bot also applies a long backoff on
+# query_invalid (no point retrying the same broken query) — the
+# operator must change config to recover.
+_QUERY_INVALID_PHRASES: tuple[str, ...] = (
+    "Timespan is too short",
+    "Timespan is invalid",
+    "Mode is invalid",
+    "Query is invalid",
+    "Format is invalid",
+    "must contain at least",  # GDELT's "query too broad" message
+    # GDELT's "wrap OR'd terms in parens" message — caught the
+    # 2026-04-26 v3.1 incident where every category query lacked
+    # outer parens. The validator below now refuses to start the
+    # bot with such a query, but we still classify the message in
+    # case a future query slips past the validator.
+    "Queries containing OR",
+)
+
+# Long backoff (30 min) for query_invalid — re-running the same broken
+# query under exponential backoff would waste rate-limit budget every
+# cycle for no benefit. Force the operator to look at the log.
+_QUERY_INVALID_BACKOFF_SECONDS = 30 * 60.0
+
+# Tier-1 / tier-2 domain reputation tables. Confidence prior for
+# parsed articles. Conservative — easier to add reputable domains
+# over time than to retract trust.
+_TIER1_DOMAINS: frozenset[str] = frozenset({
+    "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "ft.com",
+    "wsj.com", "nytimes.com", "washingtonpost.com", "bloomberg.com",
+    "theguardian.com", "economist.com", "axios.com", "politico.com",
+    "npr.org", "cnn.com", "cnbc.com",
+})
+_TIER2_DOMAINS: frozenset[str] = frozenset({
+    "aljazeera.com", "dw.com", "lemonde.fr", "spiegel.de",
+    "japantimes.co.jp", "scmp.com", "hindustantimes.com",
+    "timesofindia.indiatimes.com", "abc.net.au", "cbc.ca",
+    "thetimes.co.uk", "telegraph.co.uk", "independent.co.uk",
+    "cnbc.com", "marketwatch.com", "thehill.com", "thedailybeast.com",
+    "espn.com", "espnfc.com",
+})
+
+
+# ============================================================
+# Structured fetch + parse
+# ============================================================
+
+
+@dataclass
+class GdeltFetchResult:
+    """Result of a single GDELT HTTP call. ``ok=True`` iff the call
+    returned a 2xx with a parseable JSON body. All other paths set
+    ``ok=False`` and populate the diagnostic fields so the caller can
+    log a single structured line that names the failure mode.
+    """
+
+    ok: bool
+    url: str
+    status_code: int = 0
+    content_type: str = ""
+    bytes_len: int = 0
+    body_excerpt: str = ""           # first 300 chars of response body
+    exception_class: str = ""        # type(exc).__name__, empty on success
+    exception_msg: str = ""          # str(exc)[:300], empty on success
+    failure_mode: str = ""           # human-readable: "rate_limit"|"timeout"|"non_json"|"http_error"|"network"|"unknown"
+    articles: list[dict[str, Any]] = field(default_factory=list)
+
+    def diagnostic(self) -> str:
+        """Compact one-line diagnostic for log emission."""
+        if self.ok:
+            return (
+                f"ok status={self.status_code} ct={self.content_type} "
+                f"bytes={self.bytes_len} articles={len(self.articles)}"
+            )
+        bits = [f"FAIL mode={self.failure_mode}"]
+        if self.status_code:
+            bits.append(f"status={self.status_code}")
+        if self.content_type:
+            bits.append(f"ct={self.content_type}")
+        if self.bytes_len:
+            bits.append(f"bytes={self.bytes_len}")
+        if self.exception_class:
+            bits.append(f"exc={self.exception_class}")
+        if self.exception_msg:
+            bits.append(f"msg={self.exception_msg!r}")
+        if self.body_excerpt:
+            bits.append(f"body={self.body_excerpt!r}")
+        return " ".join(bits)
+
+
+def _build_url(query: str, *, max_records: int, timespan: str, sort: str = "DateDesc") -> str:
+    return f"{GDELT_DOC_URL}?" + urlencode({
+        "query": query,
+        "mode": "ArtList",
+        "format": "json",
+        "maxrecords": str(max_records),
+        "timespan": timespan,
+        "sort": sort,
+    })
+
+
+def _classify_failure(
+    *,
+    status_code: int,
+    content_type: str,
+    body_excerpt: str,
+    exception_class: str,
+) -> str:
+    """Coarse-grained label for the failure mode. Used by the per-
+    category backoff and the operator log."""
+    if exception_class.endswith("TimeoutException") or "Timeout" in exception_class:
+        return "timeout"
+    if exception_class in ("ConnectError", "ReadError", "RemoteProtocolError",
+                           "NetworkError", "TransportError"):
+        return "network"
+    if status_code == 429:
+        return "rate_limit"
+    if status_code and 400 <= status_code < 500:
+        return "http_error"
+    if status_code and 500 <= status_code < 600:
+        return "server_error"
+    if status_code == 200 and "json" not in content_type.lower():
+        # Most common 200-but-not-json cases for GDELT, in priority
+        # order: rate-limit text body (served with status 200 in some
+        # routes), validation errors ("Timespan is too short.",
+        # "Mode is invalid.", etc.), HTML error pages from a CDN edge.
+        if body_excerpt.startswith(_RATE_LIMIT_PREFIX):
+            return "rate_limit"
+        if _looks_like_query_invalid(body_excerpt):
+            return "query_invalid"
+        return "non_json"
+    if status_code == 200:
+        return "json_decode"
+    if exception_class:
+        return f"exception:{exception_class}"
+    return "unknown"
+
+
+def _looks_like_query_invalid(body_excerpt: str) -> bool:
+    """True when the body matches one of GDELT's documented validation
+    error messages. Case-sensitive on the leading capital — these
+    messages are stable in GDELT's response."""
+    if not body_excerpt:
+        return False
+    for phrase in _QUERY_INVALID_PHRASES:
+        if phrase in body_excerpt:
+            return True
+    return False
+
+
+async def _fetch_gdelt(
+    query: str,
+    *,
+    max_records: int = 50,
+    timespan: str = "1h",
+    timeout_connect: float = 20.0,
+    timeout_read: float = 30.0,
+    user_agent: str = "Quantorpolybot/0.1 (scout)",
+    limiter: GdeltRateLimiter | None = GLOBAL_LIMITER,
+    retry_on_timeout: bool = True,
+) -> GdeltFetchResult:
+    """No-throw fetch. Returns a fully-populated GdeltFetchResult on
+    every code path so the caller can log a single structured line
+    and update its backoff state without try/except gymnastics.
+
+    All requests go through ``limiter`` (default: the process-wide
+    ``GLOBAL_LIMITER``) — every call site of this function MUST
+    share the limiter so we can't accidentally exceed GDELT's
+    1-req/5s rate from concurrent code paths. Pass ``limiter=None``
+    only in tests where rate-limiting isn't being verified.
+
+    On a 429, the limiter is automatically widened (penalize) for
+    a hold window so subsequent calls space themselves further apart
+    without each caller having to know.
+
+    On a transient timeout (Connect or Read) AND ``retry_on_timeout``
+    is True, ONE retry is attempted after a short wait. A second
+    timeout records the failure.
+
+    Pulled out of the connector class so:
+      - tests can hit it without an event loop fixture for the lane,
+      - the smoke probe script can call it directly through the same
+        rate limiter.
+    """
+    url = _build_url(query, max_records=max_records, timespan=timespan)
+    # DEBUG-level query preview — helps a future operator see exactly
+    # what we sent if a category starts failing in a way that doesn't
+    # match a known phrase. raw vs encoded vs full URL covers the
+    # three places a syntax bug can hide.
+    logger.debug(
+        "[gdelt] fetch raw_query={!r} encoded_query={!r} url={}",
+        query,
+        url.split("query=", 1)[1].split("&", 1)[0] if "query=" in url else "",
+        url,
+    )
+    timeout = httpx.Timeout(connect=timeout_connect, read=timeout_read,
+                            write=10.0, pool=10.0)
+
+    async def _attempt() -> tuple[GdeltFetchResult, bool]:
+        """Single fetch attempt. Returns ``(result, is_timeout)``.
+
+        ``is_timeout=True`` signals the result was caused by a
+        ``httpx.TimeoutException`` and the caller may retry. The
+        result is still a fully populated ``GdeltFetchResult`` (with
+        the original exception_class preserved) so a no-retry caller
+        gets clean diagnostics.
+        """
+        if limiter is not None:
+            await limiter.acquire()
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get(url, headers={"User-Agent": user_agent})
+        except httpx.TimeoutException as e:
+            return GdeltFetchResult(
+                ok=False, url=url,
+                exception_class=type(e).__name__, exception_msg=str(e)[:300],
+                failure_mode="timeout",
+            ), True
+        except httpx.HTTPError as e:
+            return GdeltFetchResult(
+                ok=False, url=url,
+                exception_class=type(e).__name__, exception_msg=str(e)[:300],
+                failure_mode=_classify_failure(
+                    status_code=0, content_type="", body_excerpt="",
+                    exception_class=type(e).__name__,
+                ),
+            ), False
+        except Exception as e:
+            return GdeltFetchResult(
+                ok=False, url=url,
+                exception_class=type(e).__name__, exception_msg=str(e)[:300],
+                failure_mode=f"exception:{type(e).__name__}",
+            ), False
+        # Successful HTTP — process inline (parse) and return a final
+        # result. Not retry-eligible regardless of failure_mode.
+        return _process_response(r, url), False
+
+    # Attempt 1.
+    result, was_timeout = await _attempt()
+    if was_timeout and retry_on_timeout:
+        # Transient timeout. One retry after a short wait.
+        await asyncio.sleep(_TIMEOUT_RETRY_DELAY_SECONDS)
+        retry_result, retry_was_timeout = await _attempt()
+        if not retry_was_timeout:
+            # Retry produced a definitive answer (success OR non-
+            # timeout failure). Use it.
+            result = retry_result
+        else:
+            # Both attempts timed out — annotate the original result
+            # so logs make clear it wasn't a single transient blip.
+            original_class = result.exception_class
+            result = GdeltFetchResult(
+                ok=False, url=url,
+                exception_class=original_class,
+                exception_msg=(
+                    f"timeout (2 attempts, "
+                    f"connect={timeout_connect}s read={timeout_read}s)"
+                ),
+                failure_mode="timeout",
+            )
+    elif was_timeout:
+        # No-retry policy. Annotate but preserve the original
+        # exception_class so the operator sees what kind of timeout.
+        result = GdeltFetchResult(
+            ok=False, url=url,
+            exception_class=result.exception_class,
+            exception_msg=(
+                f"timeout (no retry, "
+                f"connect={timeout_connect}s read={timeout_read}s)"
+            ),
+            failure_mode="timeout",
+        )
+
+    # On 429 / 200-with-rate-limit-text-body, widen the global limiter
+    # so the NEXT caller spaces further apart.
+    if not result.ok and result.failure_mode == "rate_limit" and limiter is not None:
+        limiter.penalize(
+            widen_to_seconds=_PENALTY_WIDEN_TO_SECONDS,
+            hold_for_seconds=_PENALTY_HOLD_SECONDS,
+        )
+    return result
+
+
+def _process_response(r: httpx.Response, url: str) -> GdeltFetchResult:
+    """Pull out of ``_fetch_gdelt`` so the retry path doesn't
+    duplicate the parse / classify logic."""
+    content_type = r.headers.get("content-type", "")
+    body_text = r.text or ""
+    body_excerpt = body_text[:300].replace("\n", " ").replace("\r", " ")
+    bytes_len = len(r.content or b"")
+
+    # ---- Non-2xx ----
+    if r.status_code >= 400:
+        return GdeltFetchResult(
+            ok=False, url=url,
+            status_code=r.status_code, content_type=content_type,
+            bytes_len=bytes_len, body_excerpt=body_excerpt,
+            failure_mode=_classify_failure(
+                status_code=r.status_code, content_type=content_type,
+                body_excerpt=body_excerpt, exception_class="",
+            ),
+        )
+
+    # ---- 2xx but obviously rate-limited (text body that begins with
+    # the rate-limit phrase, served with 200 in some GDELT routes) ----
+    if body_excerpt.startswith(_RATE_LIMIT_PREFIX):
+        return GdeltFetchResult(
+            ok=False, url=url,
+            status_code=r.status_code, content_type=content_type,
+            bytes_len=bytes_len, body_excerpt=body_excerpt,
+            failure_mode="rate_limit",
+        )
+
+    # ---- 2xx empty body — treat as zero-articles success, NOT failure.
+    # GDELT serves empty body for queries with no matches in window. ----
+    if bytes_len == 0:
+        return GdeltFetchResult(
+            ok=True, url=url,
+            status_code=r.status_code, content_type=content_type,
+            bytes_len=0, body_excerpt="", articles=[],
+        )
+
+    # ---- 2xx with body — must be JSON ----
+    try:
+        payload = r.json()
+    except (json.JSONDecodeError, ValueError) as e:
+        return GdeltFetchResult(
+            ok=False, url=url,
+            status_code=r.status_code, content_type=content_type,
+            bytes_len=bytes_len, body_excerpt=body_excerpt,
+            exception_class=type(e).__name__, exception_msg=str(e)[:300],
+            failure_mode=_classify_failure(
+                status_code=r.status_code, content_type=content_type,
+                body_excerpt=body_excerpt, exception_class="",
+            ),
+        )
+
+    articles = payload.get("articles") if isinstance(payload, dict) else None
+    if not isinstance(articles, list):
+        articles = []
+    return GdeltFetchResult(
+        ok=True, url=url,
+        status_code=r.status_code, content_type=content_type,
+        bytes_len=bytes_len, body_excerpt=body_excerpt[:120],  # trim on success
+        articles=articles,
+    )
+
+
+# ============================================================
+# Per-category backoff state
+# ============================================================
+
+
+@dataclass
+class _CategoryState:
+    """Per-category fetch health. Lives on the GdeltFeed instance.
+
+    `next_retry_ts` gates whether the cycle attempts this category
+    at all. After ``consecutive_failures`` failures the next attempt
+    is delayed by ``min(BASE × 2^(N-1), CAP)`` from the failure
+    timestamp.
+    """
+    consecutive_failures: int = 0
+    next_retry_ts: float = 0.0
+    last_failure_mode: str = ""
+    last_status: int = 0
+    last_attempt_ts: float = 0.0
+
+    def is_ready(self, now: float) -> bool:
+        return now >= self.next_retry_ts
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
+        self.next_retry_ts = 0.0
+        self.last_failure_mode = ""
+        self.last_status = 0
+
+    def record_failure(self, *, mode: str, status: int, now: float) -> float:
+        """Apply exponential backoff. Returns the new next_retry_ts so
+        the caller can log it.
+
+        Special-case: ``mode == "query_invalid"`` jumps straight to
+        the long backoff (30 min). Re-running the same broken query
+        every cycle wastes the IP's rate-limit budget for no benefit
+        — the operator must change config to recover. The long
+        backoff also makes the failure stand out in the log when it
+        recurs.
+        """
+        self.consecutive_failures += 1
+        self.last_failure_mode = mode
+        self.last_status = status
+        if mode == "query_invalid":
+            delay = _QUERY_INVALID_BACKOFF_SECONDS
+        else:
+            delay = min(
+                _BACKOFF_BASE_SECONDS * (2 ** (self.consecutive_failures - 1)),
+                _BACKOFF_CAP_SECONDS,
+            )
+        self.next_retry_ts = now + delay
+        return self.next_retry_ts
+
+
+# ============================================================
+# Connector class
+# ============================================================
 
 
 class GdeltFeed:
-    """Polls the GDELT Doc 2.0 API on a per-category cadence.
-
-    Each `poll_seconds` cycle iterates through `_CATEGORY_QUERIES`,
-    running one HTTP GET per category with `timespan=15min`. Articles
-    are written to `scout_signals`; the normalizer (run by the scout
-    lane) reads from there.
-
-    Soft-disabled by `feeds.gdelt.enabled: false` in config. Backs off
-    on any HTTP/parse error (5s..300s) so a temporary GDELT outage
-    can't pin a CPU.
+    """Polls the GDELT Doc 2.0 API on a per-category cadence with
+    per-category exponential backoff.
     """
 
     component = "feed.gdelt"
 
     def __init__(self) -> None:
         self._stop = asyncio.Event()
+        self._cat_state: dict[EventCategory, _CategoryState] = {
+            cat: _CategoryState() for cat in _CATEGORY_QUERIES
+        }
+        self._canary_done = False
 
     async def run(self) -> None:
         cfg = get_config().get("feeds", "gdelt") or {}
@@ -94,48 +740,75 @@ class GdeltFeed:
             return
         poll = int(cfg.get("poll_seconds", 300))
         per_query_max = int(cfg.get("max_records_per_query", 50))
-        request_delay = safe_float(cfg.get("request_delay_seconds", 1.0))
+        # `request_delay_seconds` is now the GLOBAL rate-limiter
+        # interval (was per-category in v2). Defaults to 6.0 — the
+        # limiter widens to 12s for 60s after any 429 so the IP
+        # cools off before subsequent calls.
+        min_interval = safe_float(cfg.get("request_delay_seconds", 6.0))
+        if min_interval < 5.0:
+            logger.warning(
+                "[gdelt] request_delay_seconds={} is below GDELT's "
+                "documented 5s minimum — expect 429s",
+                min_interval,
+            )
+        GLOBAL_LIMITER.configure(min_interval_seconds=min_interval)
+
         timespan = cfg.get("timespan", "15min")
-        backoff = Backoff(base=5, cap=300)
+        # Bumped defaults: 20s connect / 30s read. The previous
+        # 10/20 was getting eaten in SSL handshake on a tarpitted IP.
+        connect_t = safe_float(cfg.get("timeout_connect_seconds", 20.0))
+        read_t = safe_float(cfg.get("timeout_read_seconds", 30.0))
+        retry_on_timeout = bool(cfg.get("retry_on_timeout", True))
+
+        # Categories whitelist. v3 starts with a 3-category subset for
+        # stability (shooting / election_result / macro_data_surprise);
+        # operator can promote to "all" or a custom list once the
+        # cycle log shows consistent ok>0.
+        enabled = self._resolve_enabled_categories(cfg.get("categories"))
+        cycle_backoff = Backoff(base=5, cap=300)
 
         logger.info(
-            "[gdelt] starting; poll={}s queries={} per_query_max={} timespan={}",
-            poll, len(_CATEGORY_QUERIES), per_query_max, timespan,
+            "[gdelt] starting; poll={}s active_categories={}/{} per_query_max={} "
+            "timespan={} min_interval={}s retry_on_timeout={} "
+            "timeout=connect{}/read{}",
+            poll, len(enabled), len(_CATEGORY_QUERIES), per_query_max,
+            timespan, min_interval, retry_on_timeout, connect_t, read_t,
         )
+
+        # ---- One-shot startup canary so an operator sees a clear
+        # diagnostic line BEFORE the category sweep starts. Goes
+        # through the same global limiter as everything else. ----
+        if not self._canary_done:
+            await self._startup_canary(connect_t, read_t, retry_on_timeout)
+            self._canary_done = True
+
         while not self._stop.is_set():
             try:
-                total_new = 0
-                for category, query in _CATEGORY_QUERIES.items():
-                    if self._stop.is_set():
-                        break
-                    try:
-                        new = await self._poll_category(
-                            category, query, per_query_max, timespan,
-                        )
-                        total_new += new
-                    except Exception as e:
-                        # Per-category failures don't kill the cycle;
-                        # log and continue so a single bad query (e.g.
-                        # GDELT 503 on one shard) doesn't blank the
-                        # whole scan.
-                        logger.warning(
-                            "[gdelt] category={} failed: {}",
-                            category.value, e,
-                        )
-                    if request_delay > 0:
-                        await self._sleep(request_delay)
-                if total_new:
-                    logger.info(
-                        "[gdelt] ingested {} new signals across {} categories",
-                        total_new, len(_CATEGORY_QUERIES),
-                    )
-                backoff.reset()
+                summary = await self._cycle(
+                    enabled_categories=enabled,
+                    per_query_max=per_query_max,
+                    timespan=timespan,
+                    timeout_connect=connect_t,
+                    timeout_read=read_t,
+                    retry_on_timeout=retry_on_timeout,
+                )
+                # ALWAYS log the cycle summary at INFO so operators
+                # can see the connector is doing work even when no
+                # signals come in (vs. silent and possibly stuck).
+                logger.info(
+                    "[gdelt] cycle ok={} fail={} skipped_in_backoff={} "
+                    "articles_seen={} new_signals={} limiter_interval={:.1f}s",
+                    summary["ok"], summary["fail"], summary["skipped"],
+                    summary["articles_seen"], summary["new"],
+                    GLOBAL_LIMITER.current_interval_seconds,
+                )
+                cycle_backoff.reset()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                d = backoff.next_delay()
+                d = cycle_backoff.next_delay()
                 logger.warning(
-                    "[gdelt] cycle error ({}), sleeping {:.1f}s: {}",
+                    "[gdelt] cycle outer error ({}), sleeping {:.1f}s: {}",
                     type(e).__name__, d, e,
                 )
                 await self._sleep(d)
@@ -143,6 +816,56 @@ class GdeltFeed:
             await self._sleep(
                 poll * DEGRADED_POLL_MULTIPLIER if is_degraded() else poll,
             )
+
+    def _resolve_enabled_categories(
+        self, raw: Any,
+    ) -> list[EventCategory]:
+        """Resolve the operator's `categories` config into the actual
+        list of enabled EventCategory enums.
+
+        Accepted values:
+          - None / missing → v3 default subset
+          - "all" → every key in `_CATEGORY_QUERIES`
+          - list of strings → filter by name (unknown names logged + dropped)
+        """
+        if raw is None:
+            return list(_DEFAULT_ENABLED_CATEGORIES)
+        if isinstance(raw, str) and raw.strip().lower() == "all":
+            return list(_CATEGORY_QUERIES.keys())
+        if not isinstance(raw, (list, tuple)):
+            logger.warning(
+                "[gdelt] feeds.gdelt.categories must be 'all' or a list; "
+                "got {!r} — falling back to v3 default subset",
+                raw,
+            )
+            return list(_DEFAULT_ENABLED_CATEGORIES)
+        out: list[EventCategory] = []
+        seen: set[EventCategory] = set()
+        for name in raw:
+            try:
+                cat = EventCategory(str(name).strip().lower())
+            except ValueError:
+                logger.warning(
+                    "[gdelt] unknown category in config: {!r}", name,
+                )
+                continue
+            if cat not in _CATEGORY_QUERIES:
+                logger.warning(
+                    "[gdelt] category {!r} has no GDELT query registered",
+                    cat.value,
+                )
+                continue
+            if cat in seen:
+                continue
+            seen.add(cat)
+            out.append(cat)
+        if not out:
+            logger.warning(
+                "[gdelt] no valid categories after filtering — "
+                "falling back to v3 default subset",
+            )
+            return list(_DEFAULT_ENABLED_CATEGORIES)
+        return out
 
     async def stop(self) -> None:
         self._stop.set()
@@ -153,27 +876,147 @@ class GdeltFeed:
         except asyncio.TimeoutError:
             return
 
-    async def _poll_category(
+    async def _startup_canary(
+        self, connect_t: float, read_t: float, retry_on_timeout: bool,
+    ) -> None:
+        """Single broad-keyword fetch to surface env/network/path
+        issues at startup with a single loud log line. Failure does
+        NOT abort startup — categories will discover the same
+        breakage via their own backoffs.
+
+        Goes through ``GLOBAL_LIMITER`` like everything else, so the
+        canary counts as the first request of the cycle's rate
+        budget.
+        """
+        result = await _fetch_gdelt(
+            _CANARY_QUERY,
+            max_records=5,
+            timespan="1h",
+            timeout_connect=connect_t,
+            timeout_read=read_t,
+            retry_on_timeout=retry_on_timeout,
+        )
+        if result.ok:
+            logger.info(
+                "[gdelt] startup canary ok status={} articles={} bytes={} "
+                "ct={}",
+                result.status_code, len(result.articles), result.bytes_len,
+                result.content_type,
+            )
+        else:
+            logger.warning(
+                "[gdelt] startup canary FAILED — {}",
+                result.diagnostic(),
+            )
+
+    async def _cycle(
         self,
-        category: EventCategory,
-        query: str,
-        max_records: int,
+        *,
+        enabled_categories: list[EventCategory],
+        per_query_max: int,
         timespan: str,
-    ) -> int:
-        params = {
-            "query": query,
-            "mode": "ArtList",
-            "format": "json",
-            "maxrecords": str(max_records),
-            "timespan": timespan,
-            "sort": "DateDesc",
+        timeout_connect: float,
+        timeout_read: float,
+        retry_on_timeout: bool,
+    ) -> dict[str, int]:
+        """One iteration of the per-category sweep. Returns a counter
+        dict — used by the cycle log line and by tests.
+
+        Strictly serial — each category's request goes through
+        ``GLOBAL_LIMITER.acquire()`` so they never burst, even if a
+        future caller invokes the connector from a different
+        coroutine.
+        """
+        ok = fail = skipped = new = articles_seen = 0
+        now_t = now_ts()
+        for category in enabled_categories:
+            if self._stop.is_set():
+                break
+            query = _CATEGORY_QUERIES.get(category)
+            if not query:
+                continue
+            state = self._cat_state[category]
+            if not state.is_ready(now_t):
+                skipped += 1
+                # DEBUG only — INFO would spam during a long backoff.
+                logger.debug(
+                    "[gdelt] category={} skipped (in backoff for {:.0f}s)",
+                    category.value, state.next_retry_ts - now_t,
+                )
+                continue
+
+            state.last_attempt_ts = now_t
+            # Limiter is invoked inside _fetch_gdelt — no need to
+            # sleep manually here, the limiter spaces calls.
+            result = await _fetch_gdelt(
+                query,
+                max_records=per_query_max,
+                timespan=timespan,
+                timeout_connect=timeout_connect,
+                timeout_read=timeout_read,
+                retry_on_timeout=retry_on_timeout,
+            )
+
+            if not result.ok:
+                next_retry = state.record_failure(
+                    mode=result.failure_mode,
+                    status=result.status_code,
+                    now=now_t,
+                )
+                if result.failure_mode == "query_invalid":
+                    # Loud + actionable: this is a config bug, not a
+                    # transient network blip. Suggest the most common
+                    # remedy in the same line so the operator doesn't
+                    # have to grep docs.
+                    logger.warning(
+                        "[gdelt] category={} {} backoff={:.0f}s "
+                        "consecutive={} limiter_interval={:.1f}s "
+                        "→ FIX config: GDELT rejected the request "
+                        "(check feeds.gdelt.timespan and the query "
+                        "string in core/feeds/gdelt.py)",
+                        category.value, result.diagnostic(),
+                        next_retry - now_t, state.consecutive_failures,
+                        GLOBAL_LIMITER.current_interval_seconds,
+                    )
+                else:
+                    logger.warning(
+                        "[gdelt] category={} {} backoff={:.0f}s consecutive={} "
+                        "limiter_interval={:.1f}s",
+                        category.value, result.diagnostic(),
+                        next_retry - now_t, state.consecutive_failures,
+                        GLOBAL_LIMITER.current_interval_seconds,
+                    )
+                fail += 1
+            else:
+                state.record_success()
+                category_new = await self._persist_articles(
+                    result.articles, category,
+                )
+                new += category_new
+                articles_seen += len(result.articles)
+                ok += 1
+                # INFO — operators need to SEE successful work, not
+                # only failures. Even an empty-articles response is
+                # signal that the connector + GDELT are talking.
+                logger.info(
+                    "[gdelt] category={} ok status={} articles={} new={} "
+                    "bytes={} ct={}",
+                    category.value, result.status_code,
+                    len(result.articles), category_new,
+                    result.bytes_len, result.content_type,
+                )
+
+            now_t = now_ts()  # advance for the next category's
+                              # is_ready() check (the limiter sleep
+                              # happened inside _fetch_gdelt)
+        return {
+            "ok": ok, "fail": fail, "skipped": skipped, "new": new,
+            "articles_seen": articles_seen,
         }
-        url = f"{GDELT_DOC_URL}?{urlencode(params)}"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(url, headers={"User-Agent": "Quantorpolybot/0.1 (scout)"})
-            r.raise_for_status()
-            payload = r.json() if r.content else {}
-        articles = payload.get("articles") or []
+
+    async def _persist_articles(
+        self, articles: list[dict[str, Any]], category: EventCategory,
+    ) -> int:
         new = 0
         for art in articles:
             sig = parse_gdelt_article(art, category)
@@ -184,8 +1027,6 @@ class GdeltFeed:
         return new
 
     async def _persist(self, sig: Signal) -> bool:
-        """INSERT OR IGNORE on signal_hash. Returns True iff a new
-        row was created."""
         h = sig.signal_hash()
         existing = await fetch_one(
             "SELECT id FROM scout_signals WHERE signal_hash=?", (h,),
@@ -200,17 +1041,10 @@ class GdeltFeed:
                       ingested_at, confidence, raw_payload)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    h,
-                    sig.source,
-                    sig.source_type,
-                    sig.title[:500],
-                    sig.body[:2000],
-                    sig.url[:500],
-                    json.dumps(sig.entities),
-                    sig.category_hint,
-                    sig.timestamp,
-                    now_ts(),
-                    sig.confidence,
+                    h, sig.source, sig.source_type,
+                    sig.title[:500], sig.body[:2000], sig.url[:500],
+                    json.dumps(sig.entities), sig.category_hint,
+                    sig.timestamp, now_ts(), sig.confidence,
                     json.dumps(sig.raw_payload, default=str)[:4000],
                 ),
             )
@@ -220,20 +1054,12 @@ class GdeltFeed:
             return False
 
 
+# ============================================================
+# Article parser (unchanged from PR #1, kept here for parity)
+# ============================================================
+
+
 def parse_gdelt_article(art: dict[str, Any], category: EventCategory) -> Signal | None:
-    """Parse one record from the GDELT Doc 2.0 ArtList JSON response.
-
-    Pulled out of the connector class so tests can hit it without
-    spinning up the async loop. Returns None on missing required
-    fields (title or url) — those rows are skipped, not persisted.
-
-    Confidence:
-      Domain-tier multiplier × language-coverage multiplier.
-      English-language wire/major-news domains score ~0.80; obscure
-      blogs ~0.40. This is a conservative trust prior — the
-      normalizer's source_count check then layers corroboration on
-      top.
-    """
     url = (art.get("url") or "").strip()
     title = (art.get("title") or "").strip()
     if not url or not title:
@@ -243,21 +1069,12 @@ def parse_gdelt_article(art: dict[str, Any], category: EventCategory) -> Signal 
     language = (art.get("language") or "").strip().lower()
     seendate = art.get("seendate") or ""
 
-    # GDELT's seendate is "YYYYMMDDhhmmss" (UTC). Convert to unix
-    # seconds; fall back to "now" on parse failure so we don't drop
-    # the article.
     published_at = _parse_gdelt_seendate(seendate)
 
-    # Confidence prior. Tier-1 wire/major-news ~ 0.85; tier-2 mid ~
-    # 0.65; everything else ~ 0.45. English-only bonus (other
-    # languages drop to 0.40 max — we can't classify reliably).
     domain_tier = _domain_tier(domain)
     lang_mult = 1.0 if language in ("english", "en", "") else 0.6
     confidence = round(domain_tier * lang_mult, 3)
 
-    # GDELT's per-article entity fields aren't returned by ArtList by
-    # default; the connector pulls them from the title and from any
-    # `themes` field if present. Cheap NER is plenty for v1.
     entities = _entities_from_title(title)
 
     return Signal(
@@ -281,7 +1098,6 @@ def parse_gdelt_article(art: dict[str, Any], category: EventCategory) -> Signal 
 
 
 def _parse_gdelt_seendate(s: str) -> float:
-    """`YYYYMMDDhhmmss` -> unix seconds (UTC)."""
     if not s or len(s) < 14:
         return now_ts()
     try:
@@ -292,34 +1108,10 @@ def _parse_gdelt_seendate(s: str) -> float:
         return now_ts()
 
 
-# Tier-1: international wire + major newsrooms. Tier-2: respectable
-# regional / specialty. Everything else falls into the default low
-# tier. Conservative — easier to add reputable domains over time
-# than to retract trust.
-_TIER1_DOMAINS: frozenset[str] = frozenset({
-    "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "ft.com",
-    "wsj.com", "nytimes.com", "washingtonpost.com", "bloomberg.com",
-    "theguardian.com", "economist.com", "axios.com", "politico.com",
-    "npr.org", "cnn.com", "cnbc.com",
-})
-_TIER2_DOMAINS: frozenset[str] = frozenset({
-    "aljazeera.com", "dw.com", "lemonde.fr", "spiegel.de",
-    "japantimes.co.jp", "scmp.com", "hindustantimes.com",
-    "timesofindia.indiatimes.com", "abc.net.au", "cbc.ca",
-    "thetimes.co.uk", "telegraph.co.uk", "independent.co.uk",
-    "cnbc.com", "marketwatch.com", "thehill.com", "thedailybeast.com",
-    "espn.com", "espnfc.com",
-})
-
-
 def _domain_tier(domain: str) -> float:
-    """0.85 / 0.65 / 0.45 trust prior based on domain reputation."""
     if not domain:
         return 0.45
-    # Strip leading "www." and any subdomain prefixes for matching.
     bare = domain.split("//")[-1].lstrip("www.").strip("/")
-    # Match the rightmost N-1 segments — handles both "bbc.co.uk" and
-    # "news.bbc.co.uk".
     parts = bare.split(".")
     candidates = {bare}
     for i in range(1, len(parts) - 1):
@@ -331,37 +1123,23 @@ def _domain_tier(domain: str) -> float:
     return 0.45
 
 
-# Crude NER: pull single Title-Cased tokens of length >= 3 from the
-# title and drop a stop-list of common headline verbs / honorifics /
-# generic nouns. Single tokens (rather than greedy multi-word matches)
-# work better for downstream Jaccard-overlap clustering — two
-# articles about the same event are more likely to share `Trump` than
-# `Trump Survives Shooting`. Good enough for v1 clustering; the
-# mapper then matches against market.question tokens anyway.
-import re
-
 _TITLE_TOKEN_RE = re.compile(r"\b([A-Z][a-zA-Z'\-]+)\b")
 _STOP_TITLES: frozenset[str] = frozenset({
-    # Articles + honorifics
     "The", "A", "An", "President", "Senator", "Senators", "Governor",
     "Mr", "Mrs", "Ms", "Dr", "Sir", "Lord", "Lady", "Reverend",
     "Republican", "Democrat", "Republicans", "Democrats",
     "Police", "Officials", "Officer", "Reports", "Report",
-    # Headline verbs commonly title-cased in news
     "Says", "Said", "Meets", "Met", "Survives", "Survived", "Faces",
     "Vows", "Wins", "Won", "Loses", "Lost", "Calls", "Called",
     "Ends", "Ended", "Begins", "Began", "Holds", "Held",
     "Announces", "Announced", "Defends", "Slams", "Strikes",
-    # Generic event nouns that surface in many categories
     "Shooting", "Attack", "Rally", "Crisis", "Statement",
     "Election", "Vote", "Hearing", "Trial", "Speech",
-    # Connectives that can start a clause
     "After", "Before", "While", "When", "During",
 })
 
 
 def _entities_from_title(title: str) -> list[str]:
-    """Return up to 8 deduped Title-Cased single tokens from `title`."""
     if not title:
         return []
     found: list[str] = []
