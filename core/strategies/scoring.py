@@ -37,7 +37,7 @@ from loguru import logger
 
 from core.markets.cache import Market
 from core.signals.context import build_market_context
-from core.signals.ollama_client import OllamaClient
+from core.signals.ollama_client import OllamaClient, deep_realtime_enabled
 from core.strategies import heuristic
 from core.utils.config import get_prompts
 from core.utils.helpers import clamp, safe_float
@@ -146,7 +146,21 @@ async def score(
     """Run Ollama on (market, text). Returns None on any failure — the
     lane decides whether that means skip or use a fallback. Most callers
     should prefer ``score_with_fallback`` so a stalled Ollama doesn't
-    silently zero out the lane's entries."""
+    silently zero out the lane's entries.
+
+    If the caller asks for tier=``deep`` but ``deep_realtime_enabled``
+    is False, returns None without dispatching. This is the kill
+    switch for CPU-only deployments where a 7B+ model would burn
+    20-45s per realtime call. Lanes that need a fallback should use
+    ``score_with_fallback`` instead — it produces a heuristic Score
+    in this case rather than None.
+    """
+    if tier == "deep" and not deep_realtime_enabled():
+        logger.debug(
+            "[scoring] deep tier disabled in realtime; skipping market={}",
+            market.market_id,
+        )
+        return None
     client = client or OllamaClient()
     caller = _tier_call(client, tier)
     context = await _gather_context(market)
@@ -176,6 +190,12 @@ async def score_with_timeout(
     can log the saturation reason explicitly. Use
     ``score_with_fallback`` if you want the saturation check folded in.
     """
+    if tier == "deep" and not deep_realtime_enabled():
+        logger.debug(
+            "[scoring] deep tier disabled in realtime; heuristic for market={}",
+            market.market_id,
+        )
+        return _heuristic_as_score(text, market, source="heuristic")
     client = client or OllamaClient()
     caller = _tier_call(client, tier)
     context = await _gather_context(market)
@@ -250,6 +270,15 @@ async def score_with_fallback(
     """
     client = client or OllamaClient()
     market_tag = str(market.market_id)
+
+    # Master kill-switch: deep tier is structurally too slow for the
+    # realtime path on CPU-only deployments. Skip Ollama entirely.
+    if tier == "deep" and not deep_realtime_enabled():
+        logger.debug(
+            "[scoring] tier=deep disabled in realtime; heuristic for market={}",
+            market_tag,
+        )
+        return _heuristic_as_score(text, market, source="heuristic")
 
     # Preempt on fast-tier saturation. The fast queue is the only one
     # with an alert threshold today (queue_depth_alert in config); we

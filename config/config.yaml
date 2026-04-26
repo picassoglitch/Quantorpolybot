@@ -355,6 +355,20 @@ ollama:
   fast_temperature: 0.2
   deep_temperature: 0.3
   validator_temperature: 0.1
+  # Master kill-switch for the deep tier in the realtime path. The
+  # April 2026 soak machine is currently CPU-only — `ollama serve`
+  # logs `inference compute id=cpu` — so qwen2.5:7b takes 20-45s
+  # per call, which the realtime signal pipeline can't tolerate.
+  # When this is false:
+  #   - Signal pipeline routes through core.strategies.heuristic
+  #     (keyword scorer) instead of generate_json.
+  #   - core.strategies.scoring.score / score_with_fallback gate
+  #     tier=="deep" calls (return None / heuristic respectively).
+  #   - Deep tier remains available for background jobs (prompt
+  #     evolution, news enrichment) where multi-second latency is OK.
+  # Flip back to true once Ollama is running on GPU and a deep call
+  # consistently completes under the 20s budget.
+  deep_realtime_enabled: false
   queue_depth_alert: 5
   # Per-tier in-flight caps. Each tier has its own asyncio.Semaphore so
   # a stuck deep call doesn't starve fast scoring. Legacy

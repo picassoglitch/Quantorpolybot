@@ -68,6 +68,31 @@ def _ollama_cfg() -> dict[str, Any]:
     return get_config().get("ollama") or {}
 
 
+def deep_realtime_enabled() -> bool:
+    """Master kill-switch for the deep tier in the realtime path.
+
+    When False, all realtime callers (signal pipeline, lane scoring)
+    must avoid the deep tier and downgrade to fast/heuristic. Deep
+    Ollama remains available for background work like prompt
+    evolution and news enrichment, where multi-second latency is
+    fine.
+
+    Set to ``false`` in deployments where Ollama runs CPU-only or
+    on a 7B+ model that can't meet the 20s realtime budget — the
+    April 2026 soak machine logged ``inference compute id=cpu``
+    with qwen2.5:7b, producing 20-45s timeouts on every pipeline
+    call. With deep_realtime_enabled=false the pipeline routes
+    through ``core.strategies.heuristic.score`` and the bot
+    operates entirely in heuristic mode without ever entering the
+    DEGRADED state on deep Ollama latency.
+    """
+    raw = _ollama_cfg().get("deep_realtime_enabled", True)
+    # Tolerate string YAML values like "false"/"FALSE" defensively.
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("false", "0", "no", "off")
+    return bool(raw)
+
+
 # ============================================================================
 # Process-wide circuit breaker
 # ============================================================================

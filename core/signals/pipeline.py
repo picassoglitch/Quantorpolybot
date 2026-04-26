@@ -23,7 +23,8 @@ from core.signals.candidates import (
 from core.signals.context import build_market_context
 from core.learning.source_trust import get_source_weights, trust_weight_for
 from core.signals.guards import apply_true_prob_cap, guard_config, hallucination_reject
-from core.signals.ollama_client import OllamaClient
+from core.signals.ollama_client import OllamaClient, deep_realtime_enabled
+from core.strategies import heuristic
 from core.utils.config import get_config, get_prompts
 from core.utils.db import execute, fetch_all, fetch_one
 from core.utils.helpers import clamp, now_ts, safe_float
@@ -260,6 +261,23 @@ class SignalPipeline:
             },
             ensure_ascii=False,
         )
+        # ---- Branch: deep tier off-realtime mode --------------------
+        # When ``ollama.deep_realtime_enabled`` is false (typical for
+        # CPU-only Ollama deployments), the signal pipeline can't
+        # afford a 20-45s deep call per feed item. Skip the LLM and
+        # use the keyword heuristic instead — same downstream guards,
+        # same risk gates, same signal-row schema, just a faster
+        # source. The bot stays useful while waiting for GPU/Ollama
+        # to come back or for the operator to re-enable the flag.
+        if not deep_realtime_enabled():
+            await self._process_with_heuristic(
+                item=item,
+                markets=markets,
+                prompt_version="heuristic",
+                text=text,
+            )
+            return
+
         candidates_json = json.dumps(serialize_candidates(markets), ensure_ascii=False)
         # Build per-candidate context concurrently so the prompt can reason
         # about price trajectory / peer signals / news frequency per market
@@ -487,6 +505,182 @@ class SignalPipeline:
         # persists the risk-checked size on the signal row for audit but
         # does not submit any orders — lanes pull their own opportunities
         # from feed_items / market state directly.
+        await execute(
+            "UPDATE signals SET status=?, size_usd=? WHERE id=?",
+            ("APPROVED", decision.size_usd, signal_id),
+        )
+
+    async def _process_with_heuristic(
+        self,
+        *,
+        item: dict[str, Any],
+        markets: list[Any],
+        prompt_version: str,
+        text: str,
+    ) -> None:
+        """Heuristic-only path used when ``deep_realtime_enabled`` is
+        False. Picks a single market — the linked one if the feed item
+        has ``meta.linked_market_id``, otherwise the top heuristic
+        candidate by keyword overlap — runs ``heuristic.score`` against
+        it, and feeds the result through the same guards + risk
+        evaluator as the deep path. The signal row's
+        ``prompt_version`` is set to ``heuristic`` so the dashboard /
+        operator can tell the source apart.
+        """
+        if not markets:
+            return
+
+        # Prefer the explicitly-linked market when the feed already
+        # tagged one (polymarket_news, predictit_xref, per-market
+        # google_news). Fall back to the top heuristic candidate.
+        meta = _decode_meta(item.get("meta"))
+        linked_id = (meta.get("linked_market_id") or "").strip()
+        chosen_market: Any | None = None
+        if linked_id:
+            chosen_market = await get_market(linked_id)
+        if chosen_market is None:
+            chosen_market = markets[0]
+
+        # Record so the rescore-cooldown guard above counts this market
+        # as recently scored.
+        self._market_last_scored[str(chosen_market.market_id)] = now_ts()
+
+        h = heuristic.score(text, chosen_market)
+        if h.direction == 0:
+            # No directional signal from keywords. Persist a clearly-
+            # labelled row so the operator can see the pipeline
+            # processed the item but had nothing to act on.
+            await execute(
+                """INSERT INTO signals
+                (feed_item_id, market_id, implied_prob, confidence, edge,
+                 mid_price, side, size_usd, reasoning, prompt_version,
+                 created_at, status, category)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    int(item["id"]),
+                    chosen_market.market_id,
+                    chosen_market.mid, 0.0, 0.0, chosen_market.mid,
+                    "NONE", 0.0,
+                    "heuristic: ambiguous (no directional keywords)",
+                    prompt_version, now_ts(),
+                    "heuristic_neutral",
+                    (chosen_market.category or "").strip(),
+                ),
+            )
+            return
+
+        await self._finalize_signal(
+            item=item,
+            market=chosen_market,
+            implied=h.implied_prob,
+            confidence=h.confidence,
+            reasoning=f"heuristic: {h.reasoning}"[:500],
+            prompt_version=prompt_version,
+        )
+
+    async def _finalize_signal(
+        self,
+        *,
+        item: dict[str, Any],
+        market: Any,
+        implied: float,
+        confidence: float,
+        reasoning: str,
+        prompt_version: str,
+    ) -> None:
+        """Apply guards + insert + risk eval — shared between the deep
+        and heuristic paths so they can't drift. The deep path inlines
+        the same logic for historical reasons; this helper is the
+        canonical implementation for the heuristic path and any
+        future scoring source. It does NOT submit any orders.
+        """
+        mid = market.mid
+
+        # Long-horizon cap on the implied prob — same rule as the deep path.
+        guards = guard_config(get_config().get("risk"))
+        days = days_until_resolve(market.close_time)
+        capped_implied = apply_true_prob_cap(
+            implied,
+            days,
+            long_horizon_days=guards["long_horizon_days"],
+            cap=guards["long_horizon_cap"],
+        )
+        if capped_implied != implied:
+            reasoning = (
+                reasoning + f" [long_horizon_cap {implied:.2f}->{capped_implied:.2f}]"
+            )[:500]
+            implied = capped_implied
+
+        # Hallucination guard. Heuristic confidence is already capped
+        # at 0.70 by core.strategies.heuristic, but this guard is
+        # symmetric across sources — a heuristic that cooks up a high
+        # true_prob on a thin-evidence low-mid market should still be
+        # rejected.
+        num_sources, weighted_sources = await self._count_recent_sources(
+            str(market.market_id),
+        )
+        reject_reason = hallucination_reject(
+            true_prob=implied,
+            mid=mid,
+            num_sources=num_sources,
+            weighted_sources=weighted_sources,
+            low_mid_threshold=guards["low_mid_threshold"],
+            high_true_prob_threshold=guards["high_true_prob_threshold"],
+            min_sources=guards["min_sources"],
+        )
+
+        edge = implied - mid
+        side = "BUY" if edge > 0 else "SELL"
+
+        signal_id = await execute(
+            """INSERT INTO signals
+            (feed_item_id, market_id, implied_prob, confidence, edge, mid_price,
+             side, size_usd, reasoning, prompt_version, created_at, status,
+             category)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                int(item["id"]),
+                market.market_id,
+                implied, confidence, edge, mid, side, 0.0,
+                reasoning, prompt_version, now_ts(),
+                "PENDING",
+                (market.category or "").strip(),
+            ),
+        )
+
+        if reject_reason:
+            await self._reject(signal_id, reject_reason)
+            return
+
+        cfg = get_config().get("risk") or {}
+        if confidence < float(cfg.get("min_confidence", 0.65)):
+            await self._reject(signal_id, "low confidence")
+            return
+        if abs(edge) < float(cfg.get("min_edge", 0.04)):
+            await self._reject(signal_id, "edge below threshold")
+            return
+
+        plausibility_max_edge = float(cfg.get("plausibility_max_edge", 0.25))
+        plausibility_min_implied = float(cfg.get("plausibility_min_implied", 0.05))
+        in_low_tail = mid < plausibility_min_implied
+        in_high_tail = mid > (1.0 - plausibility_min_implied)
+        if (
+            plausibility_max_edge > 0
+            and abs(edge) > plausibility_max_edge
+            and (in_low_tail or in_high_tail)
+        ):
+            await self._reject(
+                signal_id,
+                f"implausible_edge edge={edge:+.2f} mid={mid:.3f}",
+            )
+            return
+
+        try:
+            decision = await self._risk.evaluate(market, side, implied, confidence)
+        except RiskRejection as rej:
+            await self._reject(signal_id, str(rej))
+            return
+
         await execute(
             "UPDATE signals SET status=?, size_usd=? WHERE id=?",
             ("APPROVED", decision.size_usd, signal_id),

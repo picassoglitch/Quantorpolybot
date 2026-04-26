@@ -58,6 +58,12 @@ def _test_sized_config():
 
     ollama = dict(saved["ollama"] or {})
     ollama["validator_high_stakes_usd"] = 200
+    # Tests assume deep tier is allowed in realtime — production
+    # config may have ``deep_realtime_enabled: false`` for CPU-only
+    # deployments, but the test suite predates that flag and several
+    # tests explicitly mock ``generate_json``. Tests that need the
+    # gate flipped should override it in their own fixture.
+    ollama["deep_realtime_enabled"] = True
     cfg._data["ollama"] = ollama
 
     yield
