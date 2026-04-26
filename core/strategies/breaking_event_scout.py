@@ -42,6 +42,7 @@ from core.scout import impact as scout_impact
 from core.scout import mapper as scout_mapper
 from core.scout import normalizer as scout_normalizer
 from core.scout.event import Event, EventCategory, Signal
+from core.signals.ollama_client import OllamaClient
 from core.utils.config import get_config
 from core.utils.db import execute, fetch_all, fetch_one
 from core.utils.helpers import now_ts, safe_float
@@ -91,6 +92,10 @@ class BreakingEventScoutLane:
         # acceptable; the breaking_events UPSERT will collapse
         # duplicates by event_id.
         self._cursor_id: int = 0
+        # v3: shared Ollama client for the LLM polarity inference
+        # path. Lazily-instantiated process-wide in OllamaClient
+        # itself, so this is essentially free.
+        self._ollama = OllamaClient()
 
     async def run(self) -> None:
         cfg = _cfg()
@@ -323,11 +328,26 @@ class BreakingEventScoutLane:
             snap.mid if snap is not None and snap.mid > 0 else match.market.mid
         )
 
-        impact = scout_impact.score_impact(
-            event, match, market_mid=market_mid,
+        # v3: route through the async wrapper so the LLM-polarity
+        # path can fire on high-severity events the rule table can't
+        # resolve. The wrapper falls through to the rule-based score
+        # on any LLM failure, so this never blocks the lane on
+        # Ollama latency beyond the configured timeout.
+        cfg_for_eval = _cfg()
+        impact = await scout_impact.score_impact_async(
+            event, match,
+            market_mid=market_mid,
+            ollama_client=self._ollama,
+            llm_enabled=bool(cfg_for_eval.get("llm_polarity_enabled", True)),
+            llm_severity_floor=safe_float(
+                cfg_for_eval.get("llm_polarity_severity_threshold", 0.70),
+            ),
+            llm_timeout_seconds=safe_float(
+                cfg_for_eval.get("llm_polarity_timeout_seconds", 5.0),
+            ),
         )
         decision = await scout_candidate.evaluate(
-            event, match, impact, market_mid=market_mid, cfg=_cfg(),
+            event, match, impact, market_mid=market_mid, cfg=cfg_for_eval,
         )
         if decision.observed:
             # Visible-not-traded path. Logged at INFO so the operator
@@ -360,6 +380,20 @@ class BreakingEventScoutLane:
             return "rejected"
 
         size_usd = await _position_size(decision.confidence, _cfg())
+        # v3: apply the high-sev-solo size multiplier (0.30x by
+        # default) when the candidate passed corroboration via the
+        # single-source override. Cooldown / max-exposure / edge
+        # gates already ran inside scout_candidate.evaluate — this
+        # is sizing-only.
+        if decision.size_multiplier != 1.0:
+            size_usd = max(0.0, size_usd * decision.size_multiplier)
+            logger.info(
+                "[scout] event={} market={} sized down to {:.2f} "
+                "(multiplier={:.2f}, high_sev_solo={})",
+                event.event_id, match.market.market_id,
+                size_usd, decision.size_multiplier,
+                decision.high_sev_solo,
+            )
         approved = await allocator.reserve(LANE, size_usd)
         if approved is None:
             logger.info(

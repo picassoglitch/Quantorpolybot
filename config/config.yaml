@@ -299,6 +299,26 @@ breaking_event_scout:
   # it before sizing up.
   base_position_usd: 1.0
   max_position_usd: 3.0
+  # ---- v3: high-severity-solo corroboration override ----
+  # When source_count==1 AND no primary source is present BUT
+  # event.severity is very high (>= threshold), allow the candidate
+  # through corroboration but apply a reduced size multiplier to
+  # compensate for the lower confidence. Cooldown / max-exposure /
+  # edge / spread / age safety checks STILL run normally — this is
+  # sizing-only.
+  high_sev_solo_threshold: 0.80
+  high_sev_solo_size_multiplier: 0.30
+  # ---- v3: LLM polarity inference ----
+  # When rules can't resolve direction AND event.severity is high
+  # enough, ask the fast Ollama tier whether the event makes YES
+  # more likely (BUY), less likely (SELL), or unclear. On any LLM
+  # failure (timeout, exception, "unclear" response), the lane
+  # falls through to the rule-based score → observed-mode if
+  # severity + match thresholds are met. Set
+  # `llm_polarity_enabled: false` to opt out entirely.
+  llm_polarity_enabled: true
+  llm_polarity_severity_threshold: 0.70
+  llm_polarity_timeout_seconds: 5.0
 kelly:
   enabled: true
   fraction: 0.25

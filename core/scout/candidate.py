@@ -74,6 +74,14 @@ class CandidateDecision:
     # status="observed", no shadow trade opened. Lane uses this to
     # increment the observed-counter in scan summaries.
     observed: bool = False
+    # v3: marks a candidate that passed corroboration via the
+    # high-severity-solo override (severity >= 0.80, single
+    # non-primary source). Lane MUST apply ``size_multiplier`` to
+    # the position size to compensate for the lower-confidence
+    # corroboration. Cooldown / max-exposure / edge / spread / age
+    # safety checks already ran normally — this is sizing only.
+    high_sev_solo: bool = False
+    size_multiplier: float = 1.0
 
 
 async def evaluate(
@@ -113,8 +121,41 @@ async def evaluate(
     require_primary_or_corroboration = bool(
         cfg.get("require_primary_or_corroboration", True)
     )
+    # v3 (corroboration override): allow a SINGLE-source candidate
+    # through the corroboration check ONLY if the event severity is
+    # very high (>= ``high_sev_solo_threshold``, default 0.80).
+    # The lane applies a reduced position-size multiplier
+    # (``high_sev_solo_size_multiplier``, default 0.30x) to compensate
+    # for the lower-confidence corroboration. Cooldown / max-exposure
+    # / edge / spread / age safety checks still run unchanged — the
+    # override is ONLY against the corroboration check.
+    high_sev_solo_threshold = safe_float(
+        cfg.get("high_sev_solo_threshold", 0.80)
+    )
+    high_sev_solo_size_multiplier = safe_float(
+        cfg.get("high_sev_solo_size_multiplier", 0.30)
+    )
+
+    # Detect single-primary-source override eligibility BEFORE
+    # running _check_rules so the rule can short-circuit cleanly.
+    # See _check_rules for how this propagates.
+    high_sev_solo = (
+        require_primary_or_corroboration
+        and event.severity >= high_sev_solo_threshold
+        and event.source_count == 1
+        and not (set(s.lower() for s in event.sources) & primary_sources)
+    )
 
     # ---- Build the audit snapshot up front (used for both branches) ----
+    # v3 added the persistence fields needed for the planned
+    # Pattern Discovery layer to compute "price after N min" by
+    # JOINing event_market_candidates × price_ticks at query time:
+    #   - event.first_seen_timestamp + event.timestamp_detected
+    #     (when the cluster was first observed)
+    #   - market.snapshot_price + market.snapshot_taken_at
+    #     (price at the moment the candidate was evaluated; the
+    #     `yes_token` field provides the JOIN key on price_ticks)
+    snapshot_taken_at = now_ts()
     audit_snapshot = {
         "event": {
             "category": event.category.value,
@@ -124,6 +165,11 @@ async def evaluate(
             "sources": event.sources,
             "entities": event.entities,
             "title": event.title,
+            # v3 persistence fields — recoverable forensics for the
+            # Pattern Discovery layer.
+            "timestamp_detected": event.timestamp_detected,
+            "first_seen_timestamp": event.first_seen_at,
+            "last_seen_timestamp": event.last_seen_at,
         },
         "market_match": {
             "score": match.score,
@@ -140,6 +186,12 @@ async def evaluate(
             "expected_nudge": impact.expected_nudge,
             "polarity_reasoning": impact.polarity_reasoning,
             "components": impact.components,
+            # v3: surface the LLM-inferred polarity flag if present
+            # so the dashboard can distinguish rule-based from
+            # LLM-inferred decisions.
+            "polarity_source": getattr(
+                impact, "polarity_source", "rules",
+            ),
         },
         "market": {
             "mid": mid,
@@ -148,7 +200,17 @@ async def evaluate(
             "spread_cents": (market.best_ask - market.best_bid) * 100.0,
             "liquidity": market.liquidity,
             "yes_token": market.yes_token() or "",
+            # v3 persistence fields. ``snapshot_price`` is the alias
+            # the spec asked for; ``snapshot_taken_at`` is the
+            # timestamp side of the JOIN key against price_ticks
+            # (use ts > snapshot_taken_at + N*60 for the
+            # "price after N min" calculation).
+            "snapshot_price": mid,
+            "snapshot_taken_at": snapshot_taken_at,
         },
+        # v3: top-level flags so a SQL query can grep without
+        # JSON-path-extracting the nested fields. Cheap to populate.
+        "high_sev_solo": high_sev_solo,
     }
 
     # ---- Run rules in cheap-first order ----
@@ -165,6 +227,7 @@ async def evaluate(
         min_liquidity=min_liquidity,
         max_spread_cents=max_spread_cents,
         require_primary_or_corroboration=require_primary_or_corroboration,
+        high_sev_solo=high_sev_solo,
     )
 
     # ---- Per-event cool-down: only N accepted candidates per event_id ----
@@ -265,6 +328,9 @@ async def evaluate(
         market_mid=mid,
         impact_snapshot=audit_snapshot,
     )
+    accepted_size_mult = (
+        high_sev_solo_size_multiplier if high_sev_solo else 1.0
+    )
     return CandidateDecision(
         accepted=True,
         event_id=event.event_id,
@@ -277,9 +343,15 @@ async def evaluate(
         reason=(
             f"accepted: edge={edge:+.3f} conf={impact.confidence:.2f} "
             f"sources={event.source_count} sev={event.severity:.2f}"
+            + (
+                f" (high_sev_solo, size_mult={accepted_size_mult:.2f})"
+                if high_sev_solo else ""
+            )
         ),
         impact_snapshot=audit_snapshot,
         audit_row_id=row_id,
+        high_sev_solo=high_sev_solo,
+        size_multiplier=accepted_size_mult,
     )
 
 
@@ -297,6 +369,7 @@ def _check_rules(
     min_liquidity: float,
     max_spread_cents: float,
     require_primary_or_corroboration: bool,
+    high_sev_solo: bool = False,
 ) -> str | None:
     """Returns first failing rule's reason string, or None on pass."""
     age = now_ts() - event.timestamp_detected
@@ -327,12 +400,16 @@ def _check_rules(
             f"{min_confidence:.2f}"
         )
     if require_primary_or_corroboration:
-        # Two paths to satisfaction:
+        # Three paths to satisfaction:
         #   a) >= min_sources distinct sources (corroboration)
         #   b) at least one source name in primary_sources
+        #   c) v3: high-severity-solo override — caller already
+        #      verified severity >= threshold AND source_count == 1
+        #      AND no primary source. Lane MUST apply the
+        #      ``high_sev_solo_size_multiplier`` to compensate.
         has_corroboration = event.source_count >= min_sources
         has_primary = bool(set(s.lower() for s in event.sources) & primary_sources)
-        if not (has_corroboration or has_primary):
+        if not (has_corroboration or has_primary or high_sev_solo):
             return (
                 f"insufficient corroboration: source_count={event.source_count} "
                 f"< {min_sources} and no primary source in {sorted(primary_sources)}"
