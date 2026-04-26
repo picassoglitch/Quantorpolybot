@@ -314,3 +314,28 @@ async def test_log_line_omitted_when_pool_empty(monkeypatch):
         "log line should be suppressed when no market reached the "
         f"price-band stage; got: {band_lines!r}"
     )
+
+
+# ---------------------------------------------------------------------
+# Default config regression: max_resolve_days must be 60
+# ---------------------------------------------------------------------
+
+
+def test_default_max_resolve_days_is_sixty():
+    """Pin the default value to 60 days so a future config rebase
+    can't silently revert to 14. The April 2026 supply audit showed
+    that with `max_resolve_days: 14`, the price-band filter empties
+    the candidate pool — the two changes have to land together to
+    unblock the lane. If a future operator shrinks the window again
+    they should see this test fail and re-read the comment block in
+    config.yaml before deciding whether the change still makes
+    sense.
+    """
+    from core.utils.config import get_config
+    cfg = get_config().get("scalping") or {}
+    assert cfg.get("max_resolve_days") == 60, (
+        f"scalping.max_resolve_days defaulted to {cfg.get('max_resolve_days')!r}, "
+        "expected 60. See config/config.yaml comment block above the key — "
+        "this value pairs with the price_band filter below it; reverting "
+        "without also tightening price_band will leave the lane idle."
+    )
