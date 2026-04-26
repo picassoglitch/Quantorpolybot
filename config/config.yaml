@@ -334,6 +334,19 @@ breaking_event_scout:
   llm_polarity_enabled: true
   llm_polarity_severity_threshold: 0.70
   llm_polarity_timeout_seconds: 5.0
+  # ---- v3.1 STUB: LLM-confirms-solo corroboration override ----
+  # Second override path alongside `high_sev_solo`, default OFF.
+  # When True AND the LLM polarity returned a definite direction
+  # at confidence >= 0.7 matching the candidate's market_side,
+  # the candidate passes corroboration with the same reduced size
+  # multiplier as high_sev_solo. Currently stubbed in
+  # core/strategies/breaking_event_scout.polarity_confirms_solo()
+  # — NOT YET wired into candidate.evaluate. Enable AFTER the
+  # threshold-fix soak (PR #10) proves stable AND the LLM polarity
+  # path is producing useful direction calls (check
+  # event_market_candidates.impact_snapshot.impact.polarity_source
+  # = 'llm' for actual LLM-driven decisions).
+  llm_polarity_confirms_solo_enabled: false
 kelly:
   enabled: true
   fraction: 0.25
