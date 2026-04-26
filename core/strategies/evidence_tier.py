@@ -81,8 +81,17 @@ def classify_evidence(
     that the LLM call is worth the cost.
 
     Items are dicts straight from `feed_items` (`id`, `source`,
-    `title`, `summary`, `url`, `ingested_at`). Items without a source
-    are ignored (can't count toward a source bar).
+    `title`, `summary`, `url`, `ingested_at`, optionally ``meta``).
+    Items without a usable source key are ignored (can't count toward
+    a source bar).
+
+    Distinctness key: ``meta["publisher"]`` when present, falling back
+    to ``item["source"]``. The Google News feed all comes in under one
+    source name (``"google_news"``) but each entry's ``meta.publisher``
+    is the actual outlet ("BBC", "Reuters", "ESPN", ...). Counting by
+    publisher when available — and by feed name otherwise — is what
+    lets a market with 30 articles from 10 different outlets classify
+    as STRONG instead of being collapsed to ``distinct=1``.
     """
     items_list = list(items)
     sources: set[str] = set()
@@ -91,7 +100,9 @@ def classify_evidence(
     now_t = now if now is not None else now_ts()
 
     for item in items_list:
-        src = item.get("source")
+        meta = item.get("meta")
+        publisher = meta.get("publisher") if isinstance(meta, dict) else None
+        src = publisher or item.get("source")
         if not src:
             continue
         total += 1

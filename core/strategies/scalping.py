@@ -23,6 +23,7 @@ Pattern Discovery layer):
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from loguru import logger
@@ -65,15 +66,35 @@ async def _position_size(confidence: float) -> float:
 
 async def _recent_evidence_for(market_id: str, limit: int = 5) -> list[dict[str, Any]]:
     """Pull the latest feed items tagged to this market (polymarket_news
-    and google_news per-market feeds set meta.linked_market_id)."""
+    and google_news per-market feeds set meta.linked_market_id).
+
+    The ``meta`` column is selected and JSON-decoded so downstream
+    callers (notably :func:`classify_evidence`) can read
+    ``meta.publisher`` — Google News items now carry the actual
+    publisher name extracted from the title, and the classifier counts
+    distinct publishers rather than the literal feed name
+    ``"google_news"``. Malformed JSON falls back to an empty dict so
+    the caller still gets a usable item."""
     rows = await fetch_all(
-        """SELECT id, source, title, summary, url, ingested_at
+        """SELECT id, source, title, summary, url, ingested_at, meta
            FROM feed_items
            WHERE meta LIKE ?
            ORDER BY ingested_at DESC LIMIT ?""",
         (f'%"linked_market_id":%"{market_id}"%', limit),
     )
-    return [dict(r) for r in rows]
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        item = dict(r)
+        raw_meta = item.get("meta")
+        if isinstance(raw_meta, str) and raw_meta:
+            try:
+                item["meta"] = json.loads(raw_meta)
+            except (TypeError, ValueError):
+                item["meta"] = {}
+        elif raw_meta is None:
+            item["meta"] = {}
+        items.append(item)
+    return items
 
 
 class ScalpingLane:

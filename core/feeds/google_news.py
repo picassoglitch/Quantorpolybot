@@ -43,6 +43,50 @@ _STOPWORDS: set[str] = {
 }
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-']*")
 
+# Defensive ceiling for what we'll accept as a publisher suffix. Real
+# publishers are short ("BBC", "Reuters", "The New York Times", "Jamaica
+# Observer"); a long tail almost always means the " - " was inside the
+# headline body, not a separator. Sampling 12 live titles showed all
+# publishers <= 30 chars; 60 leaves headroom without letting a
+# half-headline through.
+_PUBLISHER_MAX_LEN = 60
+
+
+def _split_title_publisher(title: str) -> tuple[str, str | None]:
+    """Split a Google News title on the LAST ``" - "`` separator.
+
+    Google News appends the source name to every entry title with a
+    literal ``" - "`` separator (ASCII space-hyphen-space, never an
+    em-dash, verified across a 12-title sample). The headline itself
+    can contain hyphens or even ``" - "`` substrings, so we use
+    :func:`str.rpartition` to peel the final segment only.
+
+    Defensive cases — return ``(title, None)`` and leave the title
+    unchanged when:
+
+    - the title is empty / falsy
+    - no ``" - "`` separator is present
+    - the suffix is empty (e.g. trailing separator)
+    - the suffix is longer than :data:`_PUBLISHER_MAX_LEN` (almost
+      certainly a sentence fragment, not a publisher name)
+    - the prefix is empty (don't strip the title to nothing)
+
+    Returning ``None`` for the publisher signals to the caller "do not
+    set ``meta.publisher``"; the caller keeps the original title intact.
+    """
+    if not title:
+        return title, None
+    head, sep, tail = title.rpartition(" - ")
+    if not sep:
+        return title, None
+    publisher = tail.strip()
+    cleaned = head.strip()
+    if not publisher or not cleaned:
+        return title, None
+    if len(publisher) > _PUBLISHER_MAX_LEN:
+        return title, None
+    return cleaned, publisher
+
 
 class GoogleNewsFeed:
     component = "feed.google_news"
@@ -150,13 +194,16 @@ class GoogleNewsFeed:
             )
             if existing:
                 continue
-            title = (entry.get("title") or "").strip()
+            raw_title = (entry.get("title") or "").strip()
+            title, publisher = _split_title_publisher(raw_title)
             summary = (entry.get("summary") or entry.get("description") or "").strip()
             published = self._published(entry)
             meta: dict[str, Any] = {
                 "query": query,
                 "linked_market_id": market_id,
             }
+            if publisher:
+                meta["publisher"] = publisher
             await execute(
                 """INSERT OR IGNORE INTO feed_items
                 (url_hash, source, title, summary, url, published_at, ingested_at, meta)
