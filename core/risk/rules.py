@@ -39,7 +39,18 @@ class RiskEngine:
         side: str,
         implied_prob: float,
         confidence: float,
+        *,
+        bypass_kelly: bool = False,
+        preset_size_usd: float | None = None,
     ) -> RiskDecision:
+        """Approve a trade and return a sizing decision.
+
+        ``bypass_kelly`` and ``preset_size_usd`` exist for the three
+        shadow lanes: they own their own sizing logic, so the global
+        risk engine only enforces absolute caps (max_position,
+        max_total_exposure, daily_loss, spread, liquidity, cooldown)
+        rather than sizing from Kelly.
+        """
         cfg = get_config().get("risk") or {}
         kelly_cfg = get_config().get("kelly") or {}
         exec_cfg = get_config().get("execution") or {}
@@ -58,12 +69,39 @@ class RiskEngine:
             raise RiskRejection(f"stale price ({now_ts() - market.updated_at:.0f}s old)")
 
         # ---- Spread / liquidity ----
+        # A pure ratio check was rejecting legitimate longshot entries:
+        # on a $0.003 mid market with a $0.002/$0.005 book, the 3¢ absolute
+        # spread is tight enough to trade but the ratio is 100%. Accept
+        # either an absolute OR relative ceiling; for very low-price
+        # markets (mid < 0.05) rely on the absolute test only, since the
+        # ratio is inherently huge there.
         mid = market.mid
         if mid <= 0 or mid >= 1:
             raise RiskRejection("invalid mid price")
-        spread_ratio = market.spread / mid if mid else 1.0
-        if spread_ratio > float(cfg.get("max_market_spread", 0.05)):
-            raise RiskRejection(f"spread {spread_ratio:.3f} > max")
+        spread_abs = market.spread
+        spread_rel = (spread_abs / mid) if mid else 1.0
+        max_abs = float(cfg.get("max_spread_absolute", 0.03))
+        max_rel = float(cfg.get("max_spread_relative", 0.15))
+        low_price_threshold = float(cfg.get("low_price_threshold", 0.05))
+        if mid < low_price_threshold:
+            if spread_abs > max_abs:
+                raise RiskRejection(
+                    f"spread abs={spread_abs:.3f} > {max_abs:.3f} (low-price market)"
+                )
+            spread_branch = f"abs<={max_abs:.3f}"
+        else:
+            if not (spread_abs <= max_abs or spread_rel <= max_rel):
+                raise RiskRejection(
+                    f"spread abs={spread_abs:.3f} rel={spread_rel:.3f} "
+                    f"> max (abs<={max_abs:.3f} or rel<={max_rel:.3f})"
+                )
+            spread_branch = (
+                f"abs<={max_abs:.3f}" if spread_abs <= max_abs else f"rel<={max_rel:.3f}"
+            )
+        logger.debug(
+            "[risk] spread ok {} mid={:.3f} abs={:.3f} rel={:.3f} via {}",
+            market.market_id, mid, spread_abs, spread_rel, spread_branch,
+        )
         if market.liquidity < float(cfg.get("min_market_liquidity", 1000)):
             raise RiskRejection(f"liquidity {market.liquidity:.0f} < min")
 
@@ -92,15 +130,33 @@ class RiskEngine:
             raise RiskRejection(f"total exposure {open_exposure:.0f} >= cap")
 
         # ---- Correlated category bucket ----
-        cat_cap = float(cfg.get("max_correlated_exposure_usd", 200))
-        cat_exposure = await exposure_for_category(market.category or "uncategorised")
-        if cat_exposure >= cat_cap:
-            raise RiskRejection(f"category '{market.category}' exposure cap hit")
+        # Only enforce the cap when we know which bucket the market is in.
+        # Previously everything without a category got lumped into
+        # "uncategorised", so once 2-3 stray markets filled that bucket
+        # every subsequent non-sports/politics/crypto/macro signal got
+        # rejected with "category '' exposure cap hit". If Gamma didn't
+        # tell us and our keyword inference punted, skip the cap and move
+        # on rather than blocking legitimate trades.
+        category = (market.category or "").strip()
+        if category:
+            cat_cap = float(cfg.get("max_correlated_exposure_usd", 200))
+            cat_exposure = await exposure_for_category(category)
+            if cat_exposure >= cat_cap:
+                raise RiskRejection(f"category '{category}' exposure cap hit")
+        else:
+            logger.warning(
+                "[risk] market {} has no category; skipping correlation cap",
+                market.market_id,
+            )
 
         # ---- Sizing ----
         max_position = float(cfg.get("max_position_usd", 50))
         bankroll = await current_bankroll_usd()
-        if kelly_cfg.get("enabled", True):
+        if bypass_kelly or preset_size_usd is not None:
+            # Lane-driven trade: caller supplied the size, we only
+            # enforce the global ceilings (max_position, headroom).
+            size_usd = float(preset_size_usd or 0.0)
+        elif kelly_cfg.get("enabled", True):
             size_usd = kelly_size_usd(
                 prob_win=implied_prob if side == "BUY" else 1 - implied_prob,
                 price=market.best_ask if side == "BUY" else market.best_bid,
@@ -112,13 +168,15 @@ class RiskEngine:
         else:
             size_usd = float(kelly_cfg.get("max_size_usd", 50))
         size_usd = clamp(size_usd, 0.0, max_position)
-        # Confidence damp: high-confidence trades get full size, lower
-        # confidence ones get scaled down linearly.
-        size_usd *= clamp(confidence, 0.0, 1.0)
+        # Confidence damp: only for Kelly-sized trades. Lane presets are
+        # already confidence-scaled by the lane itself.
+        if not (bypass_kelly or preset_size_usd is not None):
+            size_usd *= clamp(confidence, 0.0, 1.0)
         # Don't blow remaining headroom.
         headroom = max(0.0, max_total - open_exposure)
         size_usd = min(size_usd, headroom)
-        if size_usd < float(kelly_cfg.get("min_size_usd", 5)):
+        min_size = float(kelly_cfg.get("min_size_usd", 5))
+        if size_usd < min_size:
             raise RiskRejection(f"size {size_usd:.2f} below min")
 
         # ---- Pricing ----

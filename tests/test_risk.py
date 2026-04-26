@@ -20,7 +20,7 @@ def temp_db(tmp_path, monkeypatch):
     """Point the global DB at a temp file and reset the cached path."""
     db_path = tmp_path / "test.db"
     monkeypatch.setattr(db_module, "_DB_PATH", db_path)
-    asyncio.get_event_loop().run_until_complete(db_module.init_db())
+    asyncio.run(db_module.init_db())
     yield
     monkeypatch.setattr(db_module, "_DB_PATH", None)
 
@@ -34,8 +34,8 @@ def _market(**overrides) -> Market:
         active=True,
         close_time="",
         token_ids=["tok1", "tok2"],
-        best_bid=0.48,
-        best_ask=0.52,
+        best_bid=0.49,
+        best_ask=0.51,
         last_price=0.50,
         liquidity=10_000.0,
         updated_at=time.time(),
@@ -75,3 +75,26 @@ async def test_risk_approves_clean_signal():
     decision = await risk.evaluate(market, "BUY", implied_prob=0.65, confidence=0.9)
     assert decision.size_usd > 0
     assert 0.01 < decision.target_price < 0.99
+
+
+@pytest.mark.asyncio
+async def test_risk_passes_low_price_market_with_tight_absolute_spread():
+    """A longshot-style market at mid=$0.0035 with a $0.003 absolute spread
+    should PASS even though the relative spread is ~86%. Prior behaviour
+    rejected all low-price markets because only the relative check existed.
+    """
+    risk = RiskEngine()
+    market = _market(best_bid=0.002, best_ask=0.005, last_price=0.0035)
+    # liquidity already 10_000 in the helper, comfortably above the floor.
+    decision = await risk.evaluate(market, "BUY", implied_prob=0.20, confidence=0.9)
+    assert decision.size_usd > 0
+
+
+@pytest.mark.asyncio
+async def test_risk_rejects_low_price_market_with_wide_absolute_spread():
+    """Low-price markets still get blocked when the ABSOLUTE spread is
+    wider than the configured ceiling (0.03 by default)."""
+    risk = RiskEngine()
+    market = _market(best_bid=0.01, best_ask=0.10, last_price=0.04)
+    with pytest.raises(RiskRejection):
+        await risk.evaluate(market, "BUY", implied_prob=0.5, confidence=0.9)

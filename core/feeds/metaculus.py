@@ -16,7 +16,7 @@ from core.utils.helpers import Backoff, now_ts
 
 METACULUS_URL = "https://www.metaculus.com/api2/questions/"
 _HEADERS = {
-    "User-Agent": "Quantorpolybot/0.1 (+https://github.com/local)",
+    "User-Agent": "NexoPolyBot/0.1 (+https://github.com/local)",
     "Accept": "application/json",
 }
 
@@ -46,7 +46,10 @@ class MetaculusFeed:
                     raise
                 except Exception as e:
                     delay = backoff.next_delay()
-                    logger.exception("[metaculus] error, sleeping {:.1f}s: {}", delay, e)
+                    logger.warning(
+                        "[metaculus] error ({}), sleeping {:.1f}s: {}",
+                        type(e).__name__, delay, e,
+                    )
                     await self._sleep(delay)
                     continue
                 await self._sleep(poll)

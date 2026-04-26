@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="card wide">
-  <h2>System log (DB)</h2>
-  <table>
-    <thead><tr><th>When</th><th>Level</th><th>Component</th><th>Message</th></tr></thead>
+  <h2>SYSTEM LOG // DB &middot; last 200</h2>
+  <table class="dense">
+    <thead><tr><th>ts</th><th>level</th><th>component</th><th>message</th></tr></thead>
     <tbody>
     {% for r in rows %}
       <tr>
-        <td><small>{{ '%.0f'|format(r.ts or 0) }}</small></td>
-        <td>{{ r.level }}</td>
+        <td class="muted">{{ '%.0f'|format(r.ts or 0) }}</td>
+        <td class="{{ 'bad' if r.level in ('ERROR','CRITICAL') else ('ok' if r.level == 'INFO' else 'muted') }}">{{ r.level }}</td>
         <td>{{ r.component }}</td>
         <td>{{ r.message }}</td>
       </tr>
@@ -18,7 +18,7 @@
 </div>
 
 <div class="card wide">
-  <h2>Tail of polybot.log</h2>
+  <h2>TAIL // polybot.log</h2>
   <pre class="logtail">{{ tail }}</pre>
 </div>
 {% endblock %}

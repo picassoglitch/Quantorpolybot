@@ -50,7 +50,14 @@ class FredFeed:
                     raise
                 except Exception as e:
                     delay = backoff.next_delay()
-                    logger.exception("[fred] error, sleeping {:.1f}s: {}", delay, e)
+                    # httpx's network exceptions (ConnectTimeout, ReadTimeout)
+                    # stringify to '' — log the class name as fallback so the
+                    # line isn't just "error (...), sleeping Ns: ".
+                    detail = str(e) or type(e).__name__
+                    logger.warning(
+                        "[fred] error ({}), sleeping {:.1f}s: {}",
+                        type(e).__name__, delay, detail,
+                    )
                     await self._sleep(delay)
                     continue
                 await self._sleep(poll)

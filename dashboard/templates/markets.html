@@ -1,27 +1,385 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="card wide">
-  <h2>Active markets watchlist</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Market</th><th>Question</th><th>Category</th>
-        <th>Bid</th><th>Ask</th><th>Last</th><th>Liquidity</th>
-      </tr>
-    </thead>
-    <tbody>
-    {% for r in rows %}
-      <tr>
-        <td><code>{{ r.market_id[:14] }}...</code></td>
-        <td>{{ (r.question or '')[:90] }}</td>
-        <td>{{ r.category }}</td>
-        <td>{{ '%.3f'|format(r.best_bid or 0) }}</td>
-        <td>{{ '%.3f'|format(r.best_ask or 0) }}</td>
-        <td>{{ '%.3f'|format(r.last_price or 0) }}</td>
-        <td>${{ '%.0f'|format(r.liquidity or 0) }}</td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+
+{# ---------- Defensive defaults ---------- #}
+{# Backend always supplies these; defaults keep the page rendering if
+   a future handler edit forgets one so we never 500 the whole route. #}
+{% set tape     = tape     | default({}) %}
+{% set hero     = hero     | default(None) %}
+{% set rows     = rows     | default([]) %}
+{% set events   = events   | default([]) %}
+{% set t_now            = tape.now            | default(0) %}
+{% set t_total_active   = tape.total_active   | default(0) %}
+{% set t_signals_1h     = tape.signals_1h     | default(0) %}
+{% set t_signals_24h    = tape.signals_24h    | default(0) %}
+{% set t_approved_24h   = tape.approved_24h   | default(0) %}
+{% set t_open_positions = tape.open_positions | default(0) %}
+{% set t_open_exposure  = tape.open_exposure  | default(0.0) %}
+{% set t_last_trade_ts  = tape.last_trade_ts  | default(0) %}
+
+<div class="mkx-top">
+  <div class="mkx-top__title">
+    <span class="mkx-top__label">// BOT FOCUS</span>
+    <span class="mkx-top__hint">live footprint · refresh {{ refresh }}s</span>
+  </div>
+  <a href="/markets/all" class="mkx-all-link">[ ALL MARKETS &#8599; ]</a>
 </div>
+
+{# ---------- Scrolling ticker marquee ---------- #}
+{# CSS-only loop: the `.mkx-ticker__track` is duplicated inline so the
+   translateX keyframe can wrap seamlessly at 50%. Pauses on hover. #}
+<section class="mkx-ticker" aria-label="Recent bot events">
+  <span class="mkx-ticker__badge">LIVE</span>
+  <div class="mkx-ticker__window">
+    <div class="mkx-ticker__track">
+      {% for pass in [1, 2] %}
+      {% if events %}
+        {% for e in events %}
+          <span class="mkx-ticker__item mkx-ticker__item--{{ e.kind }}">
+            <span class="mkx-ticker__ts">{{ e.ts | datetimefmt("%H:%M:%S") }}</span>
+            {% if e.kind == 'approved' %}
+              <span class="mkx-ticker__tag">SIG</span>
+              {% if e.side %}<b class="{{ 'side-buy' if e.side == 'BUY' else 'side-sell' }}">{{ e.side }}</b>{% endif %}
+              {% if e.edge %}<span class="mkx-ticker__edge">{{ '%+.1f'|format(e.edge * 100) }}&cent;</span>{% endif %}
+              <span class="mkx-ticker__q">{{ e.question or e.market_id[:10] }}&hellip;</span>
+            {% elif e.kind == 'rejected' %}
+              <span class="mkx-ticker__tag">REJ</span>
+              {% if e.edge %}<span class="mkx-ticker__edge">{{ '%+.1f'|format(e.edge * 100) }}&cent;</span>{% endif %}
+              <span class="mkx-ticker__q">{{ e.question or e.market_id[:10] }}&hellip;</span>
+            {% elif e.kind == 'scan' %}
+              <span class="mkx-ticker__tag">SCAN</span>
+              <span class="mkx-ticker__q">{{ e.question or e.market_id[:10] }}&hellip;</span>
+            {% elif e.kind == 'open' %}
+              <span class="mkx-ticker__tag">OPEN</span>
+              {% if e.side %}<b class="{{ 'side-buy' if e.side == 'BUY' else 'side-sell' }}">{{ e.side }}</b>{% endif %}
+              <span class="mkx-ticker__q">{{ e.lane }} &middot; ${{ '%.0f'|format(e.size) }}</span>
+            {% elif e.kind == 'win' %}
+              <span class="mkx-ticker__tag">WIN</span>
+              <b class="good">{{ '%+.2f'|format(e.pnl) }}</b>
+              <span class="mkx-ticker__q">{{ e.lane }}</span>
+            {% elif e.kind == 'loss' %}
+              <span class="mkx-ticker__tag">LOSS</span>
+              <b class="bad">{{ '%+.2f'|format(e.pnl) }}</b>
+              <span class="mkx-ticker__q">{{ e.lane }}</span>
+            {% else %}
+              <span class="mkx-ticker__tag">CLOSE</span>
+              <span class="mkx-ticker__q">{{ e.lane }}</span>
+            {% endif %}
+            <span class="mkx-ticker__sep">//</span>
+          </span>
+        {% endfor %}
+      {% else %}
+        <span class="mkx-ticker__item mkx-ticker__item--idle">
+          <span class="mkx-ticker__tag">IDLE</span>
+          <span class="mkx-ticker__q">awaiting activity&hellip;</span>
+          <span class="mkx-ticker__sep">//</span>
+        </span>
+      {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+{# ---------- Tape strip: what the bot is doing right now ---------- #}
+<section class="mkx-stats">
+  <div class="mkx-stat">
+    <span class="mkx-stat__label">CLOCK UTC</span>
+    <span class="mkx-stat__val mkx-stat__val--accent">
+      {% if t_now %}{{ t_now | datetimefmt }}{% else %}&mdash;{% endif %}
+    </span>
+  </div>
+  <div class="mkx-stat">
+    <span class="mkx-stat__label">WATCHLIST</span>
+    <span class="mkx-stat__val">{{ t_total_active }}</span>
+    <span class="mkx-stat__hint">markets</span>
+  </div>
+  <div class="mkx-stat">
+    <span class="mkx-stat__label">SIGNALS&nbsp;1H</span>
+    <span class="mkx-stat__val">{{ t_signals_1h }}</span>
+    <span class="mkx-stat__hint">/ 24h {{ t_signals_24h }}</span>
+  </div>
+  <div class="mkx-stat">
+    <span class="mkx-stat__label">APPROVED&nbsp;24H</span>
+    <span class="mkx-stat__val {% if t_approved_24h > 0 %}mkx-stat__val--good{% endif %}">{{ t_approved_24h }}</span>
+  </div>
+  <div class="mkx-stat">
+    <span class="mkx-stat__label">OPEN POS</span>
+    <span class="mkx-stat__val {% if t_open_positions > 0 %}mkx-stat__val--accent{% endif %}">{{ t_open_positions }}</span>
+    <span class="mkx-stat__hint">${{ '%.2f'|format(t_open_exposure) }}</span>
+  </div>
+  <div class="mkx-stat">
+    <span class="mkx-stat__label">LAST TRADE</span>
+    <span class="mkx-stat__val">
+      {% if t_last_trade_ts %}{{ t_last_trade_ts | datetimefmt }}{% else %}&mdash;{% endif %}
+    </span>
+  </div>
+</section>
+
+{# ---------- HERO: single featured market ---------- #}
+{% if hero %}
+  {% set h_bid   = hero.best_bid  or 0 %}
+  {% set h_ask   = hero.best_ask  or 0 %}
+  {% set h_last  = hero.last_price or 0 %}
+  {% set h_mid   = ((h_bid + h_ask) / 2) if (h_bid > 0 and h_ask > 0) else h_last %}
+  {% set h_spread = (h_ask - h_bid) * 100 if (h_ask > 0 and h_bid > 0) else 0 %}
+  {% set h_liq   = hero.liquidity or 0 %}
+  {% set h_liq_pct = [ ((h_liq / 100000) * 100) | round(0, 'floor'), 100 ] | min %}
+  {% set h_status_l = (hero.last_sig_status or '') | lower %}
+<section class="mkx-hero mkx-hero--{{ hero.bucket }}" data-bucket="{{ hero.bucket }}">
+  <div class="mkx-hero__rail">
+    <span class="mkx-hero__bucket mkx-hero__bucket--{{ hero.bucket }}">
+      {% if hero.bucket == 'pos' %}&#9679; OPEN POSITION
+      {% elif hero.bucket == 'sig' %}&#9670; APPROVED SIGNAL
+      {% elif hero.bucket == 'rej' %}&#9671; CLOSE CALL
+      {% elif hero.bucket == 'watch' %}&#9702; WATCHING
+      {% else %}&middot; TOP WATCHLIST
+      {% endif %}
+    </span>
+  </div>
+
+  <div class="mkx-hero__body">
+    <div class="mkx-hero__head">
+      {% if hero.category %}
+        {% set cat_l = (hero.category or '') | lower %}
+        <span class="chip chip--{{ cat_l|replace(' ', '-')|replace('/', '-') }}">{{ hero.category }}</span>
+      {% endif %}
+      <code class="mkx-hero__id">{{ hero.market_id[:14] }}&hellip;</code>
+    </div>
+    <h2 class="mkx-hero__q">{{ (hero.question or '&mdash;')[:140] }}</h2>
+
+    <div class="mkx-hero__grid">
+      {# --- Depth strip --- #}
+      <div class="mkx-hero__depth">
+        <div class="mkx-depth">
+          <div class="mkx-depth__row">
+            <span class="mkx-depth__lbl">BID</span>
+            <span class="mkx-depth__val side-buy">{{ '%.3f'|format(h_bid) }}</span>
+            <span class="mkx-depth__bar mkx-depth__bar--buy"
+                  style="width: {{ (h_bid * 100) | round(0) }}%"></span>
+          </div>
+          <div class="mkx-depth__row">
+            <span class="mkx-depth__lbl">MID</span>
+            <span class="mkx-depth__val mkx-depth__val--mid">{{ '%.3f'|format(h_mid) }}</span>
+            <span class="mkx-depth__spread">spread {{ '%.1f'|format(h_spread) }}&cent;</span>
+          </div>
+          <div class="mkx-depth__row">
+            <span class="mkx-depth__lbl">ASK</span>
+            <span class="mkx-depth__val side-sell">{{ '%.3f'|format(h_ask) }}</span>
+            <span class="mkx-depth__bar mkx-depth__bar--sell"
+                  style="width: {{ ((1 - h_ask) * 100) | round(0) }}%"></span>
+          </div>
+        </div>
+        <div class="mkx-hero__liq">
+          <span class="mkx-hero__liq-lbl">LIQUIDITY</span>
+          <span class="liq-bar mkx-hero__liq-bar">
+            <span class="liq-bar__fill" style="width: {{ h_liq_pct }}%;"></span>
+          </span>
+          <span class="mkx-hero__liq-num">${{ '%.0f'|format(h_liq) }}</span>
+        </div>
+      </div>
+
+      {# --- Sparkline --- #}
+      <div class="mkx-hero__spark">
+        <div class="mkx-spark-head">
+          <span class="mkx-spark-lbl">60m MID</span>
+          <span class="mkx-spark-pct mkx-spark-pct--{{ hero.spark.direction }}">
+            {% if hero.spark.n > 1 %}{{ '%+.2f%%'|format(hero.spark.pct) }}{% else %}&mdash;{% endif %}
+          </span>
+        </div>
+        {% if hero.spark.n > 1 %}
+        <svg class="mkx-spark mkx-spark--hero mkx-spark--{{ hero.spark.direction }}"
+             viewBox="0 0 120 28" preserveAspectRatio="none" aria-hidden="true">
+          <polygon class="mkx-spark__area" points="{{ hero.spark.area }}"/>
+          <polyline class="mkx-spark__line" points="{{ hero.spark.line }}"/>
+        </svg>
+        {% else %}
+        <div class="mkx-spark mkx-spark--hero mkx-spark--empty">
+          <span class="muted small">no recent ticks</span>
+        </div>
+        {% endif %}
+      </div>
+
+      {# --- State panel --- #}
+      <div class="mkx-hero__state">
+        {% if hero.open_positions and hero.open_positions > 0 %}
+          <div class="mkx-hero__state-line">
+            <span class="mkx-hero__state-k">POSITION</span>
+            <span class="mkx-hero__state-v">{{ hero.open_positions }} &times; {{ hero.open_lane or '&mdash;' }}</span>
+          </div>
+          <div class="mkx-hero__state-line">
+            <span class="mkx-hero__state-k">NOTIONAL</span>
+            <span class="mkx-hero__state-v">${{ '%.2f'|format(hero.open_notional or 0) }}</span>
+          </div>
+          <div class="mkx-hero__state-line">
+            <span class="mkx-hero__state-k">uPnL</span>
+            <span class="mkx-hero__state-v
+                   {{ 'good' if (hero.open_pnl or 0) > 0 else ('bad' if (hero.open_pnl or 0) < 0 else 'muted') }}">
+              {{ '%+.2f'|format(hero.open_pnl or 0) }}
+            </span>
+          </div>
+        {% elif hero.last_sig_ts %}
+          <div class="mkx-hero__state-line">
+            <span class="mkx-hero__state-k">LAST SIG</span>
+            <span class="mkx-hero__state-v">{{ hero.last_sig_ts | datetimefmt }}</span>
+          </div>
+          {% if hero.last_sig_status %}
+          <div class="mkx-hero__state-line">
+            <span class="mkx-hero__state-k">STATUS</span>
+            <span class="mkx-hero__state-v sig-status sig-status--{{ h_status_l }}">
+              {{ hero.last_sig_status | signalstatus }}
+            </span>
+          </div>
+          {% endif %}
+          {% if hero.last_sig_side and hero.last_sig_side != 'NONE' %}
+          <div class="mkx-hero__state-line">
+            <span class="mkx-hero__state-k">SIDE</span>
+            <span class="mkx-hero__state-v {{ 'side-buy' if hero.last_sig_side == 'BUY' else 'side-sell' }}">
+              {{ hero.last_sig_side }}
+            </span>
+          </div>
+          {% endif %}
+          {% if hero.last_sig_edge is not none %}
+          <div class="mkx-hero__state-line">
+            <span class="mkx-hero__state-k">EDGE</span>
+            <span class="mkx-hero__state-v">{{ '%+.1f'|format((hero.last_sig_edge or 0) * 100) }}&cent;</span>
+          </div>
+          {% endif %}
+        {% else %}
+          <div class="mkx-hero__state-line">
+            <span class="mkx-hero__state-k">STATE</span>
+            <span class="mkx-hero__state-v muted">unscored</span>
+          </div>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if hero.last_sig_reason %}
+    <p class="mkx-hero__reason">
+      <span class="mkx-hero__reason-lbl">REASONING</span>
+      <span class="mkx-hero__reason-txt">{{ (hero.last_sig_reason or '')[:220] }}&hellip;</span>
+    </p>
+    {% endif %}
+  </div>
+</section>
+{% endif %}
+
+{# ---------- Featured rows grid ---------- #}
+<section class="mkx-rows" aria-label="Featured markets">
+  <div class="mkx-rows__head">
+    <h3>WATCH GRID // {{ rows|length + (1 if hero else 0) }} / {{ t_total_active }}</h3>
+    <div class="mkx-rows__legend">
+      <span class="mkx-legend mkx-legend--pos">&#9679; pos</span>
+      <span class="mkx-legend mkx-legend--sig">&#9670; sig</span>
+      <span class="mkx-legend mkx-legend--rej">&#9671; rej</span>
+      <span class="mkx-legend mkx-legend--watch">&#9702; watch</span>
+      <span class="mkx-legend mkx-legend--bg">&middot; bg</span>
+    </div>
+  </div>
+
+  {% if rows %}
+  <div class="mkx-rows__list">
+  {% for r in rows %}
+    {% set bid  = r.best_bid   or 0 %}
+    {% set ask  = r.best_ask   or 0 %}
+    {% set last = r.last_price or 0 %}
+    {% set mid  = ((bid + ask) / 2) if (bid > 0 and ask > 0) else last %}
+    {% set spread_c = (ask - bid) * 100 %}
+    {% set status_l = (r.last_sig_status or '') | lower %}
+    {% set tick = 'flat' %}
+    {% if last and mid and (last - mid) > 0.002 %}{% set tick = 'up' %}{% endif %}
+    {% if last and mid and (mid - last) > 0.002 %}{% set tick = 'down' %}{% endif %}
+    {% set liq_pct = [ (((r.liquidity or 0) / 100000) * 100) | round(0, 'floor'), 100 ] | min %}
+    <div class="mkx-row mkx-row--{{ r.bucket }}" data-bucket="{{ r.bucket }}">
+      <div class="mkx-row__bucket">
+        {% if r.bucket == 'pos' %}&#9679;
+        {% elif r.bucket == 'sig' %}&#9670;
+        {% elif r.bucket == 'rej' %}&#9671;
+        {% elif r.bucket == 'watch' %}&#9702;
+        {% else %}&middot;
+        {% endif %}
+      </div>
+      <div class="mkx-row__main">
+        <div class="mkx-row__top">
+          {% if r.category %}
+            {% set cat_l = (r.category or '') | lower %}
+            <span class="chip chip--{{ cat_l|replace(' ', '-')|replace('/', '-') }}">{{ r.category }}</span>
+          {% endif %}
+          <span class="mkx-row__q">{{ (r.question or '')[:85] }}</span>
+        </div>
+        <div class="mkx-row__meta">
+          <code class="mkx-row__id">{{ r.market_id[:10] }}&hellip;</code>
+          {% if r.last_sig_ts %}
+            <span class="mkx-row__sig">
+              {{ r.last_sig_ts | datetimefmt("%H:%M") }}
+              {% if r.last_sig_status %}
+                <span class="sig-status sig-status--{{ status_l }}">{{ r.last_sig_status | signalstatus }}</span>
+              {% endif %}
+              {% if r.last_sig_side and r.last_sig_side != 'NONE' %}
+                <span class="{{ 'side-buy' if r.last_sig_side == 'BUY' else 'side-sell' }}">{{ r.last_sig_side }}</span>
+              {% endif %}
+              {% if r.last_sig_edge is not none and r.last_sig_edge != 0 %}
+                <span class="mkx-row__edge">{{ '%+.1f'|format((r.last_sig_edge or 0) * 100) }}&cent;</span>
+              {% endif %}
+            </span>
+          {% else %}
+            <span class="mkx-row__sig muted">never scored</span>
+          {% endif %}
+        </div>
+      </div>
+      <div class="mkx-row__book">
+        <span class="mkx-row__bid side-buy">{{ '%.3f'|format(bid) }}</span>
+        <span class="mkx-row__sep">/</span>
+        <span class="mkx-row__ask side-sell">{{ '%.3f'|format(ask) }}</span>
+        <span class="mkx-row__spread muted">{{ '%.1f'|format(spread_c) }}&cent;</span>
+      </div>
+      <div class="mkx-row__last tick tick--{{ tick }}">
+        {% if tick == 'up' %}&#9650;{% elif tick == 'down' %}&#9660;{% else %}&middot;{% endif %}
+        {{ '%.3f'|format(last) }}
+      </div>
+      <div class="mkx-row__spark">
+        {% if r.spark.n > 1 %}
+        <svg class="mkx-spark mkx-spark--{{ r.spark.direction }}"
+             viewBox="0 0 120 28" preserveAspectRatio="none" aria-hidden="true">
+          <polygon class="mkx-spark__area" points="{{ r.spark.area }}"/>
+          <polyline class="mkx-spark__line" points="{{ r.spark.line }}"/>
+        </svg>
+        {% else %}
+        <span class="mkx-spark mkx-spark--empty"></span>
+        {% endif %}
+        <span class="mkx-spark__pct mkx-spark__pct--{{ r.spark.direction }}">
+          {% if r.spark.n > 1 %}{{ '%+.1f%%'|format(r.spark.pct) }}{% else %}&mdash;{% endif %}
+        </span>
+      </div>
+      <div class="mkx-row__liq">
+        <span class="liq-bar"><span class="liq-bar__fill" style="width: {{ liq_pct }}%;"></span></span>
+        <span class="mkx-row__liq-num">${{ '%.0f'|format(r.liquidity or 0) }}</span>
+      </div>
+      {% if r.open_positions and r.open_positions > 0 %}
+      <div class="mkx-row__pos">
+        <span class="mkx-row__pos-n">{{ r.open_positions }}&times;</span>
+        <span class="mkx-row__pos-pnl
+               {{ 'good' if (r.open_pnl or 0) > 0 else ('bad' if (r.open_pnl or 0) < 0 else 'muted') }}">
+          {{ '%+.2f'|format(r.open_pnl or 0) }}
+        </span>
+      </div>
+      {% else %}
+      <div class="mkx-row__pos muted">&mdash;</div>
+      {% endif %}
+    </div>
+  {% endfor %}
+  </div>
+  {% else %}
+  <div class="mkx-empty">
+    <p class="muted">Watch grid empty &mdash; the bot hasn't scored anything yet. Padding from top-liquidity markets will appear once feeds arrive.</p>
+  </div>
+  {% endif %}
+</section>
+
+{# ---------- Footer link ---------- #}
+<div class="mkx-foot">
+  <a href="/markets/all" class="mkx-all-link mkx-all-link--big">
+    [ VIEW ALL MARKETS &#8599; ]
+  </a>
+</div>
+
 {% endblock %}

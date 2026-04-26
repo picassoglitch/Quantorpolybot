@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="filter-bar">
+  <div class="filter-bar__title">TRADE TAPE // {{ trades|length }} rows &middot; filter = <b>{{ mode_filter | upper }}</b></div>
+  <div class="filter-bar__links">
+    <a href="/trades" class="{{ 'active' if mode_filter == 'all' else '' }}">ALL</a>
+    <a href="/trades?mode_filter=shadow" class="{{ 'active' if mode_filter == 'shadow' else '' }}">SHADOW</a>
+    <a href="/trades?mode_filter=real" class="{{ 'active' if mode_filter == 'real' else '' }}">REAL</a>
+  </div>
+</section>
+
+<div class="card wide card--tape">
+  {% if trades %}
+  <table class="dense tape">
+    <thead>
+      <tr>
+        <th>age</th>
+        <th>mode</th>
+        <th>lane</th>
+        <th>market / question</th>
+        <th>side</th>
+        <th>entry</th>
+        <th>last</th>
+        <th>edge</th>
+        <th>conf</th>
+        <th>size $</th>
+        <th>pnl $</th>
+        <th>pnl %</th>
+        <th>status</th>
+        <th>evid</th>
+        <th>clob</th>
+        <th>reason</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for t in trades %}
+      <tr class="{{ 'row--real' if t.is_real else 'row--shadow' }} {{ 'row--pending' if t.status == 'PENDING_FILL' else '' }}">
+        <td class="muted">{{ t.age_ago }}</td>
+        <td><span class="tag tag--{{ t.mode }}">{{ 'REAL' if t.is_real else 'SHD' }}</span></td>
+        <td>{{ t.lane }}</td>
+        <td class="q">
+          <div class="q__q">{{ t.question[:80] }}{% if t.question|length > 80 %}…{% endif %}</div>
+          <div class="q__m"><code>{{ t.market_id[:14] }}…</code>
+            {% if t.category %}<span class="chip">{{ t.category }}</span>{% endif %}
+          </div>
+        </td>
+        <td class="{{ 'side-buy' if t.side == 'BUY' else 'side-sell' }}">{{ t.side }}</td>
+        <td>{{ '%.3f'|format(t.entry_price) }}</td>
+        <td>{{ '%.3f'|format(t.last_price) }}</td>
+        <td class="{{ 'ok' if t.edge_entry > 0 else 'bad' }}">{{ '%+.3f'|format(t.edge_entry) }}</td>
+        <td>{{ '%.2f'|format(t.confidence_entry) }}</td>
+        <td>${{ '%.2f'|format(t.size_usd) }}</td>
+        <td class="{{ 'ok' if t.pnl_usd > 0 else ('bad' if t.pnl_usd < 0 else 'muted') }}">
+          ${{ '%+.2f'|format(t.pnl_usd) }}
+        </td>
+        <td class="{{ 'ok' if t.pnl_pct > 0 else ('bad' if t.pnl_pct < 0 else 'muted') }}">
+          {{ '%+.1f%%'|format(t.pnl_pct) }}
+        </td>
+        <td><span class="status status--{{ t.status|lower }}">{{ t.status }}</span></td>
+        <td class="muted">{{ t.evidence_count }}</td>
+        <td class="muted">{% if t.clob_order_id %}<code>{{ t.clob_order_id[:10] }}</code>{% else %}-{% endif %}</td>
+        <td class="muted" title="{{ t.entry_reason }}">
+          {% if t.status == 'CLOSED' %}{{ t.close_reason }}
+          {% else %}{{ t.entry_reason[:40] }}{% if t.entry_reason|length > 40 %}…{% endif %}
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="muted big">
+      no trades yet in this filter.<br/>
+      the bot opens a position only when a signal clears the edge/confidence gate <em>and</em>
+      the lane has enough available capital. if you've been idle for a while, check /signals
+      for rejections and /lanes for pause state.
+    </p>
+  {% endif %}
+</div>
+{% endblock %}

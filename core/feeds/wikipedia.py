@@ -1,9 +1,14 @@
-"""Wikipedia / MediaWiki raw-wikitext poller.
+"""Wikipedia Current Events Portal poller.
 
-Fetches the Portal:Current_events page (and any other configured raw
-wikitext URLs), splits the content into bullet items, and stores each
-distinct bullet as its own feed_item. Dedup uses a hash of the URL +
-trimmed bullet text so the same bullet across days isn't re-stored.
+Fetches the rendered HTML of the Current Events Portal (or any other
+configured HTML URL) and extracts every top-level bulleted news item
+as its own feed_item. Dedup is per-URL + trimmed bullet text so the
+same bullet across days isn't re-stored.
+
+The previous implementation fetched the page as raw wikitext with
+`action=raw`. That form mostly expands to template transclusions and
+yields very few bullets — the observed production log was zero-ingest
+every cycle. The rendered HTML gives us the bullets directly.
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from html.parser import HTMLParser
 from typing import Iterable
 
 import httpx
@@ -22,17 +28,57 @@ from core.utils.hashing import url_hash
 from core.utils.helpers import Backoff, now_ts
 
 _HEADERS = {
-    "User-Agent": "Quantorpolybot/0.1 (+https://github.com/local)",
-    "Accept": "text/plain, text/wiki, */*",
+    "User-Agent": "NexoPolyBot/0.1 (+https://github.com/local)",
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "en-US,en;q=0.9",
 }
-# Strip MediaWiki link markup: [[Target|Display]] -> Display, [[X]] -> X.
-_LINK_RE = re.compile(r"\[\[([^\]\|]+)(?:\|([^\]]+))?\]\]")
-# Strip [[image:...]] / [[file:...]] entirely.
-_FILE_LINK_RE = re.compile(r"\[\[(?:file|image):[^\]]+\]\]", re.IGNORECASE)
-# Templates: {{...}} — replace with empty.
-_TEMPLATE_RE = re.compile(r"\{\{[^{}]*\}\}")
-# Bullet at the start of a line (one or more *).
-_BULLET_RE = re.compile(r"^\s*\*+\s*(.+)$")
+_WS_RE = re.compile(r"\s+")
+
+
+class _BulletExtractor(HTMLParser):
+    """Pulls text out of every <li> element at any nesting depth.
+
+    Good enough for the Current Events Portal, which wraps each day's
+    items in <div class="current-events-content"> -> <ul> -> <li>.
+    We don't need class-level filtering: trivial <li>s (navigation,
+    empty footers) are removed downstream by the length filter.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._depth = 0
+        self._buffer: list[str] = []
+        self._skip_depth = 0   # inside <style>, <script>, <sup> (citations)
+        self.bullets: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        if tag in ("style", "script", "sup"):
+            self._skip_depth += 1
+            return
+        if tag == "li":
+            if self._depth == 0:
+                self._buffer = []
+            self._depth += 1
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        if tag in ("style", "script", "sup"):
+            if self._skip_depth > 0:
+                self._skip_depth -= 1
+            return
+        if tag == "li" and self._depth > 0:
+            self._depth -= 1
+            if self._depth == 0:
+                text = _WS_RE.sub(" ", "".join(self._buffer)).strip()
+                # Strip the trailing citation bracket residue.
+                text = re.sub(r"\[\d+\]", "", text).strip()
+                if text:
+                    self.bullets.append(text)
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if self._skip_depth > 0:
+            return
+        if self._depth > 0:
+            self._buffer.append(data)
 
 
 class WikipediaFeed:
@@ -64,7 +110,10 @@ class WikipediaFeed:
                     raise
                 except Exception as e:
                     d = backoff.next_delay()
-                    logger.exception("[wiki] error, sleeping {:.1f}s: {}", d, e)
+                    logger.warning(
+                        "[wiki] error ({}), sleeping {:.1f}s: {}",
+                        type(e).__name__, d, e,
+                    )
                     await self._sleep(d)
                     continue
                 await self._sleep(poll)
@@ -81,11 +130,13 @@ class WikipediaFeed:
     async def _poll_one(self, client: httpx.AsyncClient, url: str) -> int:
         r = await client.get(url)
         r.raise_for_status()
-        text = r.text or ""
         new = 0
-        for bullet in _bullets(text):
-            if len(bullet) < 12:
-                continue  # skip empty / wiki-noise lines
+        for bullet in _bullets_from_html(r.text or ""):
+            # Filter out navigation / footer noise. Real news bullets
+            # on the Current Events Portal are typically ≥ 30 chars; we
+            # keep the floor at 20 to be safe.
+            if len(bullet) < 20:
+                continue
             h = url_hash(f"wiki:{url}:{bullet}")
             existing = await fetch_one(
                 "SELECT id FROM feed_items WHERE url_hash=?", (h,)
@@ -112,30 +163,13 @@ class WikipediaFeed:
         return new
 
 
-def _strip_wiki_markup(text: str) -> str:
-    text = _FILE_LINK_RE.sub("", text)
-    # Repeatedly strip templates so nested ones get reduced.
-    for _ in range(3):
-        new = _TEMPLATE_RE.sub("", text)
-        if new == text:
-            break
-        text = new
-
-    def _link_repl(m: re.Match) -> str:
-        return m.group(2) or m.group(1)
-
-    text = _LINK_RE.sub(_link_repl, text)
-    # Strip leading apostrophes used for bold/italic, '''bold''' -> bold.
-    text = re.sub(r"'{2,5}", "", text)
-    return text.strip()
-
-
-def _bullets(wikitext: str) -> Iterable[str]:
-    """Yield cleaned text for each bullet line."""
-    for raw_line in wikitext.splitlines():
-        m = _BULLET_RE.match(raw_line)
-        if not m:
-            continue
-        cleaned = _strip_wiki_markup(m.group(1))
-        if cleaned:
-            yield cleaned
+def _bullets_from_html(html: str) -> Iterable[str]:
+    if not html:
+        return []
+    parser = _BulletExtractor()
+    try:
+        parser.feed(html)
+    except Exception as e:  # HTMLParser can choke on malformed pages
+        logger.debug("[wiki] html parse error: {}", e)
+        return parser.bullets
+    return parser.bullets

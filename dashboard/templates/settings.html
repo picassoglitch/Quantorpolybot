@@ -1,92 +1,177 @@
 {% extends "base.html" %}
 {% block content %}
-<h2>Settings</h2>
-<p style="color: var(--muted);">
-  Edit the credentials and endpoints the bot uses. Saved values are written
-  to <code>.env</code> (the previous file is backed up to
-  <code>.env.bak</code>) and reloaded into the running process — no
-  restart required for code that reads env at call time
-  (Ollama client, FRED feed, py-clob-client wrapper).
-</p>
 
 {% if saved %}
-  <div class="banner banner--live" style="background: var(--good); color: #0e1116;">
-    Saved {{ saved }} setting(s).
+  <div class="banner banner--ok">
+    &raquo; {{ saved }} setting(s) saved
+    {% if just_switched_to %}&middot; mode now <b>{{ just_switched_to | upper }}</b>{% endif %}
+  </div>
+{% endif %}
+{% if error %}
+  <div class="banner banner--err">
+    &raquo; error: {{ error }}
   </div>
 {% endif %}
 
+<section class="stats-row">
+  <div class="stat stat--{{ mode }}">
+    <div class="stat__label">{{ t('settings.mode.current') }}</div>
+    <div class="stat__val">{{ t('settings.mode.real') if is_real else t('settings.mode.shadow') }}</div>
+    <div class="stat__sub">{{ 'routing to real wallet' if is_real else 'simulated capital only' }}</div>
+  </div>
+  <div class="stat stat--shadow">
+    <div class="stat__label">{{ t('settings.budget.shadow') }}</div>
+    <div class="stat__val">${{ '%.0f'|format(shadow_capital.total_usd or 0) }}</div>
+    <div class="stat__sub">min per lane ${{ '%.0f'|format(shadow_capital.min_lane_available_usd or 0) }}</div>
+  </div>
+  <div class="stat stat--real">
+    <div class="stat__label">{{ t('settings.budget.real') }}</div>
+    <div class="stat__val">${{ '%.0f'|format(real_capital.total_usd or 0) }}</div>
+    <div class="stat__sub">min per lane ${{ '%.0f'|format(real_capital.min_lane_available_usd or 0) }}</div>
+  </div>
+  <div class="stat">
+    <div class="stat__label">{{ t('settings.clob') }}</div>
+    <div class="stat__val {{ 'ok' if clob_ready else 'bad' }}">{{ 'READY' if clob_ready else 'OFF' }}</div>
+    <div class="stat__sub">required for REAL mode</div>
+  </div>
+</section>
+
 <div class="card wide">
-  <h2>Ollama</h2>
+  <h2>MODE CONTROL</h2>
+  <p class="muted">
+    <b>SHADOW</b> runs the full pipeline with simulated money. No wallet activity.<br/>
+    <b>REAL</b> routes signals through the Polymarket CLOB using the keys in .env below.
+    Switching requires an explicit confirm + clob_client.is_ready() + real_capital.total_usd > 0.
+  </p>
+  <form action="/mode" method="post" class="inline-form">
+    {% if mode == 'shadow' %}
+      <input type="hidden" name="mode" value="real">
+      <label class="chk">
+        <input type="checkbox" name="confirm" value="CONFIRM" required>
+        I confirm: route orders to the real wallet
+      </label>
+      <button type="submit" class="danger"
+        {% if not clob_ready or (real_capital.total_usd or 0) <= 0 %}disabled{% endif %}>
+        &#9632; ACTIVATE REAL MODE
+      </button>
+      {% if not clob_ready %}<p class="hint bad">CLOB client not ready &mdash; set PK / FUNDER / API key fields below.</p>{% endif %}
+      {% if (real_capital.total_usd or 0) <= 0 %}<p class="hint bad">real_capital.total_usd is 0 &mdash; set a budget first.</p>{% endif %}
+    {% else %}
+      <input type="hidden" name="mode" value="shadow">
+      <button type="submit">&#9664; RETURN TO SHADOW</button>
+      <p class="hint">existing real positions continue until they close; no new real orders will be placed.</p>
+    {% endif %}
+  </form>
+</div>
+
+<div class="card wide">
+  <h2>BUDGETS</h2>
+  <p class="muted">
+    Two independent budgets &mdash; shadow is your sandbox, real is what the wallet can spend.
+    Lane splits are configured in <code>config/config.yaml</code> (scalping 60 / event 30 / longshot 10).
+  </p>
+  <form action="/budgets" method="post" class="budget-form">
+    <label>
+      <span>SHADOW total USD</span>
+      <input type="number" name="shadow_total_usd" min="0" step="any"
+             value="{{ '%.0f'|format(shadow_capital.total_usd or 0) }}">
+    </label>
+    <label>
+      <span>REAL total USD</span>
+      <input type="number" name="real_total_usd" min="0" step="any"
+             value="{{ '%.0f'|format(real_capital.total_usd or 0) }}">
+    </label>
+    <button type="submit">SAVE BUDGETS</button>
+  </form>
+</div>
+
+<div class="card wide">
+  <h2>RESET SHADOW HISTORY</h2>
+  <p class="muted">
+    Wipes <strong>shadow positions only</strong> (open &amp; closed) so a new
+    shadow test run starts at zero. <br>
+    <strong>Real positions are NOT touched</strong> &mdash; rows with
+    <code>is_real=1</code> stay exactly as they are, so live trading is
+    unaffected. Signals, price ticks, ollama stats, cross-references, and
+    system logs are also kept because real-mode risk checks depend on
+    them (stale-price detection, concentration limits, validator drift).
+    <br>
+    The allocator is resynced: shadow lanes' deployed drops to 0, real
+    lanes are recomputed from their still-open rows. This cannot be undone.
+  </p>
+  <form action="/reset-history" method="post"
+        onsubmit="return confirm('This deletes ALL shadow positions (shadow only — real trades are preserved). Continue?');">
+    <input type="hidden" name="confirm" value="RESET">
+    <button type="submit" class="danger">DELETE SHADOW HISTORY</button>
+  </form>
+</div>
+
+<div class="card wide">
+  <h2>OLLAMA</h2>
   <ul class="kv">
-    <li><span>Server reachable</span>
+    <li><span>server reachable</span>
       {% if ollama_status.reachable %}
-        <span class="ok">YES — {{ ollama_status.tag_count }} model(s) installed</span>
+        <span class="ok">YES &mdash; {{ ollama_status.tag_count }} model(s) installed</span>
       {% else %}
-        <span class="bad">NO — {{ ollama_status.error or "unreachable" }}</span>
+        <span class="bad">NO &mdash; {{ ollama_status.error or "unreachable" }}</span>
       {% endif %}
     </li>
-    <li><span>Configured model</span>
+    <li><span>configured model</span>
       {% if ollama_status.model_present %}
         <span class="ok">{{ ollama_status.configured_model }} (installed)</span>
       {% else %}
         <span class="bad">
           {{ ollama_status.configured_model }}
-          {% if ollama_status.reachable %}— NOT installed. Run
+          {% if ollama_status.reachable %}&mdash; NOT installed. Run
             <code>ollama pull {{ ollama_status.configured_model }}</code>
             in a terminal.{% endif %}
         </span>
       {% endif %}
     </li>
     {% if ollama_status.installed_models %}
-    <li><span>Installed models</span>
-      <span style="color: var(--muted);">{{ ollama_status.installed_models | join(", ") }}</span>
+    <li><span>installed models</span>
+      <span class="muted">{{ ollama_status.installed_models | join(", ") }}</span>
     </li>
     {% endif %}
   </ul>
 </div>
 
-<form method="post" action="/settings" class="card wide" style="margin-top: 16px;">
-  <h2>Credentials &amp; endpoints</h2>
-  <p style="color: var(--muted); margin-top: 0;">
-    Sensitive values are masked after save. Leave a sensitive field
-    blank to keep the existing value; type a new value to overwrite,
-    or type <code>__clear__</code> to delete it.
+<form method="post" action="/settings" class="card wide">
+  <h2>CREDENTIALS &amp; ENDPOINTS</h2>
+  <p class="muted">
+    Values are written to <code>.env</code> (backup: <code>.env.bak</code>) and reloaded
+    without a restart. Leave sensitive fields blank to keep the existing value; type
+    <code>__clear__</code> to delete one.
   </p>
 
   {% for f in fields %}
-    <div style="margin: 12px 0; border-bottom: 1px solid var(--line); padding-bottom: 12px;">
-      <label for="f_{{ f.key }}" style="display: block; font-weight: bold;">
+    <div class="secret-field">
+      <label for="f_{{ f.key }}">
         {{ f.label }}
-        <span style="color: var(--muted); font-weight: normal;">({{ f.key }})</span>
+        <span class="muted">({{ f.key }})</span>
         {% if f.set %}
-          <span class="ok" style="font-size: 11px;">SET</span>
+          <span class="status status--open">SET</span>
         {% else %}
-          <span class="bad" style="font-size: 11px;">EMPTY</span>
+          <span class="status status--closed">EMPTY</span>
         {% endif %}
       </label>
       {% if f.help_text %}
-        <small style="color: var(--muted); display: block; margin: 4px 0;">{{ f.help_text }}</small>
+        <small class="muted">{{ f.help_text }}</small>
       {% endif %}
       {% if f.sensitive %}
-        <div style="color: var(--muted); font-size: 11px; margin: 4px 0;">
-          Currently: <code>{{ f.masked or "(empty)" }}</code>
+        <div class="muted mono">
+          currently: <code>{{ f.masked or "(empty)" }}</code>
         </div>
         <input id="f_{{ f.key }}" name="{{ f.key }}" type="password"
                autocomplete="new-password"
-               placeholder="Leave blank to keep existing value"
-               style="width: 100%; padding: 6px 8px; background: #0a0d12;
-                      color: var(--text); border: 1px solid var(--line);
-                      border-radius: 4px; font-family: inherit;" />
+               placeholder="leave blank to keep existing value" />
       {% else %}
         <input id="f_{{ f.key }}" name="{{ f.key }}" type="text"
-               value="{{ f.value }}"
-               style="width: 100%; padding: 6px 8px; background: #0a0d12;
-                      color: var(--text); border: 1px solid var(--line);
-                      border-radius: 4px; font-family: inherit;" />
+               value="{{ f.value }}" />
       {% endif %}
     </div>
   {% endfor %}
 
-  <button type="submit" style="margin-top: 8px;">Save settings</button>
+  <button type="submit">SAVE SETTINGS</button>
 </form>
 {% endblock %}

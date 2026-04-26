@@ -25,6 +25,9 @@ from core.utils.config import get_config
 from core.utils.db import execute, fetch_all, fetch_one
 from core.utils.hashing import url_hash
 from core.utils.helpers import Backoff, now_ts
+from core.utils.watchdog import is_degraded
+
+DEGRADED_POLL_MULTIPLIER = 2
 
 GOOGLE_NEWS_URL = "https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
 
@@ -83,10 +86,13 @@ class GoogleNewsFeed:
                 raise
             except Exception as e:
                 d = backoff.next_delay()
-                logger.exception("[gnews] error, sleeping {:.1f}s: {}", d, e)
+                logger.warning(
+                    "[gnews] error ({}), sleeping {:.1f}s: {}",
+                    type(e).__name__, d, e,
+                )
                 await self._sleep(d)
                 continue
-            await self._sleep(poll)
+            await self._sleep(poll * DEGRADED_POLL_MULTIPLIER if is_degraded() else poll)
 
     async def stop(self) -> None:
         self._stop.set()

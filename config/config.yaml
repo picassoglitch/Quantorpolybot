@@ -1,107 +1,299 @@
-# =====================================================================
-# Quantorpolybot configuration. All tunable knobs live here.
-# Anything in this file may be overwritten by the optimization module
-# at night if a backtested config improves Sharpe/PnL by >5%. The
-# previous config is always backed up to config/config.yaml.bak first.
-# =====================================================================
-
-# ---- Safety ----
-# Real orders are submitted ONLY when BOTH flags below are false/true
-# in the right combination. Otherwise the bot prints
-# "DRY RUN - would have placed order ...".
-dry_run: true                   # true = simulate only
-live_trading_enabled: false     # must be true AND dry_run false to trade
-
-# ---- Database / paths ----
+mode: shadow
 db_path: polybot.db
 log_dir: logs
-
-# ---- Risk limits (USD) ----
+real:
+  scalping:
+    budget: 0.0
+    max_position: 1.0
+    min_edge: 0.03
+  event_sniping:
+    budget: 0.0
+    max_position: 1.0
+    min_edge: 0.08
+    price_range:
+    - 0.05
+    - 0.95
+  longshot:
+    budget: 0.0
+limits:
+  daily_loss_cap_usd: 1.5
+  per_trade_max_loss_usd: 0.5
+  require_watchdog_healthy: true
+  max_concurrent_real_positions: 3
 risk:
-  max_position_usd: 50.0          # per single market
-  max_total_exposure_usd: 500.0   # across all open positions
-  max_daily_loss_usd: 50.0        # bot halts when breached
-  max_market_spread: 0.05         # |ask-bid| / mid
-  min_market_liquidity: 1000.0    # USD on the book
-  min_confidence: 0.65            # LLM confidence
-  min_edge: 0.04                  # |implied_prob - mid|
-  # The new key. The old `stale_price_seconds` is still honored as a
-  # fallback so older configs keep working, but new installs should
-  # use this name. 300s default is generous on purpose so dry-run
-  # mode produces enough signals to learn from.
+  max_position_usd: 500.0
+  max_total_exposure_usd: 12000.0
+  max_daily_loss_usd: 50.0
+  max_market_spread: 0.05
+  max_spread_absolute: 0.03
+  max_spread_relative: 0.15
+  low_price_threshold: 0.05
+  min_market_liquidity: 1000.0
+  min_confidence: 0.65
+  min_edge: 0.04
   stale_price_max_age_seconds: 300
-  stale_price_seconds: 300        # legacy alias; kept in sync above
-  cooldown_seconds: 600           # per-market trade cooldown
+  stale_price_seconds: 300
+  cooldown_seconds: 120
   max_orders_per_market: 1
-  max_correlated_exposure_usd: 200.0  # per category bucket
-
-# ---- Sizing (Kelly) ----
+  max_correlated_exposure_usd: 200.0
+  max_orders_per_hour_per_lane: 10
+  hallucination_low_mid: 0.05
+  hallucination_high_true_prob: 0.6
+  hallucination_min_sources: 3
+  long_horizon_cap_days: 30
+  long_horizon_cap_true_prob: 0.9
+  plausibility_max_edge: 0.25
+  plausibility_min_implied: 0.05
+shadow_risk:
+  lane_daily_drawdown_pct: 5.0
+  portfolio_daily_drawdown_pct: 3.0
+  min_rolling_win_rate: 0.4
+  rolling_win_rate_window: 50
+  max_positions_per_market: 3
+  feed_staleness_alert_minutes: 30
+  check_interval_seconds: 30
+shadow_capital:
+  total_usd: 50.0
+  lane_allocations:
+    scalping: 0.6
+    event_sniping: 0.3
+    longshot: 0.1
+  min_lane_available_usd: 0.5
+real_capital:
+  total_usd: 0.0
+  lane_allocations:
+    scalping: 0.6
+    event_sniping: 0.3
+    longshot: 0.1
+  min_lane_available_usd: 50.0
+scalping:
+  enabled: true
+  min_volume_24h: 10000
+  max_spread_cents: 3
+  min_edge: 0.04
+  min_confidence: 0.6
+  base_position_pct: 0.25
+  max_position_pct: 0.45
+  base_position: 0
+  max_position: 0
+  max_concurrent: 40
+  take_profit_pct: 8
+  stop_loss_pct: 15
+  trailing_activate_pct: 5
+  trailing_drawdown_pct: 3
+  max_age_hours: 24
+  min_resolve_days: 2
+  max_resolve_days: 14
+  min_evidence_sources: 2
+  liquidity_exit_spread_cents: 5
+  rescore_seconds: 300
+  entry_scan_seconds: 60
+  monitor_seconds: 30
+  candidate_pool_size: 300
+  scan_cap: 40
+event_sniping:
+  enabled: true
+  feed_freshness_minutes: 5
+  market_unmoved_pct: 3
+  min_edge: 0.1
+  min_confidence: 0.7
+  price_range:
+  - 0.02
+  - 0.98
+  base_position_pct: 0.3
+  max_position_pct: 0.55
+  base_position: 0
+  max_position: 0
+  max_concurrent: 15
+  take_profit_pct: 20
+  stop_loss_pct: 15
+  trailing_activate_pct: 12
+  trailing_drawdown_pct: 6
+  max_age_hours: 6
+  max_entry_latency_seconds: 60
+  min_volume_24h: 5000
+  rescore_seconds: 120
+  heuristic_fallback_timeout_seconds: 45
+  heuristic_fallback_pct: 0.25
+  heuristic_fallback_size_usd: 1.5
+  monitor_seconds: 30
+  max_days_to_resolution: 14
+microscalp:
+  enabled: true
+  entry_scan_seconds: 15
+  monitor_seconds: 10
+  move_window_seconds: 300
+  min_move_pct: 3.0
+  min_absolute_move_cents: 2.0
+  no_news_window_seconds: 600
+  min_mid: 0.2
+  max_mid: 0.8
+  max_spread_cents: 2
+  min_volume_24h: 500
+  max_horizon_hours: 72
+  max_signal_age_seconds: 600
+  base_position_pct: 0.04
+  max_position_pct: 0.07
+  base_position: 0
+  max_position: 0
+  max_concurrent: 12
+  take_profit_pct: 5.0
+  stop_loss_pct: 5.0
+  trailing_activate_pct: 2.5
+  trailing_drawdown_pct: 1.5
+  max_hold_seconds: 900
+  liquidity_exit_spread_cents: 4
+  signal_decay_exit_age_seconds: 1800
+  signal_decay_exit_max_move: 0.005
+  same_market_cooldown_seconds: 600
+resolution_day:
+  enabled: false
+  min_hours_to_resolve: 1.0
+  max_hours_to_resolve: 24.0
+  min_volume_24h: 2000
+  max_spread_cents: 6
+  min_edge: 0.06
+  min_confidence: 0.65
+  min_evidence_sources: 1
+  base_position_pct: 0.25
+  max_position_pct: 0.45
+  base_position: 0
+  max_position: 0
+  max_concurrent: 10
+  take_profit_pct: 10
+  stop_loss_pct: 12
+  trailing_activate_pct: 6
+  trailing_drawdown_pct: 4
+  liquidity_exit_spread_cents: 10
+  close_exit_minutes: 15
+  entry_scan_seconds: 120
+  monitor_seconds: 60
+longshot:
+  enabled: false
+  min_entry_price: 0.04
+  max_entry_price: 0.15
+  min_edge_multiple: 2.0
+  min_confidence: 0.6
+  min_evidence_sources: 2
+  allowed_categories:
+  - politics
+  - macro
+  - crypto
+  disallowed_categories:
+  - sports
+  min_resolve_days: 30
+  max_resolve_days: 180
+  position_pct: 0.25
+  fixed_position: 25
+  max_concurrent: 40
+  take_profit_multiple: 2.0
+  dead_floor_price: 0.015
+  dead_floor_hours: 6
+  weasel_words:
+  - likely
+  - probably
+  - maybe
+  - possibly
+  - could
+  - may
+  - might
+  max_per_market: 1
+  contradicting_confidence: 0.8
+  rescore_seconds: 3600
+  entry_scan_seconds: 600
+  monitor_seconds: 120
 kelly:
   enabled: true
-  fraction: 0.25                  # fractional Kelly safety multiplier
-  min_size_usd: 5.0
+  fraction: 0.25
+  min_size_usd: 0.25
   max_size_usd: 50.0
-
-# ---- Execution ----
 execution:
-  order_timeout_seconds: 90       # cancel unfilled orders after
-  edge_pricing_factor: 0.5        # mid + edge*factor
-  poll_interval_seconds: 5        # how often we check fills
+  order_timeout_seconds: 90
+  edge_pricing_factor: 0.5
+  poll_interval_seconds: 5
   max_open_orders: 25
-
-# ---- Feeds ----
 feeds:
   rss:
     enabled: true
     poll_seconds: 60
     sources:
-      - https://feeds.reuters.com/reuters/topNews
-      - https://feeds.reuters.com/reuters/politicsNews
-      - https://feeds.reuters.com/reuters/businessNews
-      - https://feeds.bbci.co.uk/news/world/rss.xml
-      - https://www.aljazeera.com/xml/rss/all.xml
-      - https://feeds.npr.org/1001/rss.xml
-      - https://rss.cnn.com/rss/edition.rss
-      - https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml
-      - https://www.espn.com/espn/rss/news
-      - https://rss.politico.com/politics-news.xml
-      - https://thehill.com/rss/syndicator/19109/feed/
-      - https://www.coindesk.com/arc/outboundfeeds/rss/
-      - https://cointelegraph.com/rss
+    - name: coindesk
+      url: https://www.coindesk.com/arc/outboundfeeds/rss/
+      weight: 0.75
+    - name: cointelegraph
+      url: https://cointelegraph.com/rss
+      weight: 0.65
+    - name: theblock
+      url: https://www.theblock.co/rss.xml
+      weight: 0.8
+    - name: decrypt
+      url: https://decrypt.co/feed
+      weight: 0.65
+    - name: bitcoinmagazine
+      url: https://bitcoinmagazine.com/.rss/full/
+      weight: 0.55
+    - name: cryptoslate
+      url: https://cryptoslate.com/feed/
+      weight: 0.55
+    - name: bbc_world
+      url: https://feeds.bbci.co.uk/news/world/rss.xml
+      weight: 0.85
+    - name: aljazeera
+      url: https://www.aljazeera.com/xml/rss/all.xml
+      weight: 0.7
+    - name: npr
+      url: https://feeds.npr.org/1001/rss.xml
+      weight: 0.8
+    - name: nyt_politics
+      url: https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml
+      weight: 0.85
+    - name: politico
+      url: https://rss.politico.com/politics-news.xml
+      weight: 0.8
+    - name: axios
+      url: https://api.axios.com/feed/
+      weight: 0.8
+    - name: espn
+      url: https://www.espn.com/espn/rss/news
+      weight: 0.5
+    - name: hn_crypto
+      url: https://hnrss.org/newest?q=crypto+OR+polymarket+OR+bitcoin
+      weight: 0.45
   fred:
     enabled: true
     poll_seconds: 3600
     series:
-      - CPIAUCSL
-      - UNRATE
-      - DGS10
-      - FEDFUNDS
+    - CPIAUCSL
+    - UNRATE
+    - DGS10
+    - FEDFUNDS
   metaculus:
-    # Disabled by default — Metaculus closed public access to /api2/questions/
-    # in late 2025 (now returns 403). Flip to true once you have an API token
-    # workflow wired up, otherwise this just spams the log.
     enabled: false
     poll_seconds: 1800
   polymarket_ws:
     enabled: true
-    reconnect_seconds: 15
-    subscribe_batch: 50
+    backoff_cap_seconds: 60
+    connect_timeout_seconds: 10
+    subscribe_batch: 25
+    subscribe_batch_sleep_seconds: 0.5
+    ping_interval_seconds: null
+    ping_timeout_seconds: 60
+  price_refresher:
+    enabled: true
+    poll_seconds: 60
+    stale_after_seconds: 120
+    max_markets_per_cycle: 40
+    request_delay_seconds: 0.25
   polymarket_news:
-    # Per-market related news, scraped from gamma-api /markets/{id}.
-    # Active markets only; gives us news Polymarket itself associates
-    # with each question.
     enabled: true
     poll_seconds: 600
-    max_markets_per_cycle: 80    # cap so a 3000-market DB doesn't slam Gamma
-    request_delay_seconds: 0.25  # gentle pacing between per-market requests
+    max_markets_per_cycle: 80
+    request_delay_seconds: 0.25
   google_news:
-    # Dynamic Google News RSS — generates queries from active market
-    # titles and rotates through them so we cover the whole market
-    # universe over time without hitting Google rate limits.
     enabled: true
     poll_seconds: 300
     queries_per_cycle: 10
-    request_delay_seconds: 1.0   # 1 req/sec ceiling
+    request_delay_seconds: 1.0
     hl: en-US
     gl: US
     ceid: US:en
@@ -109,71 +301,87 @@ feeds:
     enabled: true
     poll_seconds: 1800
     sources:
-      - https://en.wikipedia.org/w/index.php?title=Portal:Current_events&action=raw
-      - https://www.mediawiki.org/w/index.php?title=Template:Centralized_discussion&action=raw
-  cryptopanic:
-    # Free public feed — auth_token optional but recommended
-    # (CRYPTOPANIC_API_TOKEN env var, settable from the dashboard).
-    enabled: true
-    poll_seconds: 120
-    currencies:
-      - BTC
-      - ETH
-      - SOL
+    - https://en.wikipedia.org/wiki/Portal:Current_events
+  news_enrich:
+    enabled: false
+    model: qwen2.5:7b-instruct-q4_K_M
+    concurrency: 1
+    batch_size: 3
+    idle_poll_seconds: 60
+    busy_poll_seconds: 30.0
   predictit:
-    # PredictIt cross-reference. Pulls all open PredictIt markets,
-    # fuzzy-matches them to Polymarket questions, stores divergences
-    # in the cross_references table, and synthesises a feed_item for
-    # the signal pipeline whenever divergence > auto_signal_divergence.
     enabled: true
     poll_seconds: 600
     auto_signal_divergence: 0.08
-    fuzzy_match_threshold: 0.40
-
-# ---- Markets ----
+    fuzzy_match_threshold: 0.4
 markets:
   refresh_seconds: 300
   gamma_url: https://gamma-api.polymarket.com/markets
-  page_size: 100
+  page_size: 500
   max_pages: 30
+  page_delay_seconds: 0.1
   active_only: true
-
-# ---- Signals ----
 signals:
   candidates_per_item: 5
   ollama_timeout_seconds: 60
   prompt_version: v1
-  # Pre-Ollama keyword filter: a feed item must share at least this
-  # much Jaccard overlap with the best-matching candidate market or
-  # we skip Ollama entirely (and log a `keyword_mismatch` signal).
-  # Items from feeds that already carry a meta.linked_market_id
-  # (e.g. polymarket_news, predictit cross-refs) bypass this check.
   min_keyword_overlap: 0.05
-
-# ---- Scheduler ----
+  market_rescore_cooldown_seconds: 180
+  max_candidate_days: 365
+ollama:
+  host: http://localhost:11434
+  model: qwen2.5:7b-instruct-q4_K_M
+  fast_model: qwen2.5:7b-instruct-q4_K_M
+  deep_model: qwen2.5:7b-instruct-q4_K_M
+  validator_model: llama3:8b-instruct-q8_0
+  fast_timeout_seconds: 45
+  deep_timeout_seconds: 60
+  validator_timeout_seconds: 60
+  fast_temperature: 0.2
+  deep_temperature: 0.3
+  validator_temperature: 0.1
+  queue_depth_alert: 5
+  max_concurrent_calls: 2
+  validator_high_stakes_usd: 10
+  validator_max_prob_drift: 0.15
 scheduler:
-  market_refresh_cron: "*/5 * * * *"
-  health_check_cron: "*/1 * * * *"
-  optimization_cron: "5 3 * * *"     # 03:05 daily
-  learning_cron: "30 3 * * *"        # 03:30 daily
+  market_refresh_cron: '*/5 * * * *'
+  health_check_cron: '*/1 * * * *'
+  optimization_cron: 5 3 * * *
+  learning_cron: 30 3 * * *
+  source_trust_cron: 10 4 * * *
+  lane_rebalance_cron: 20 4 * * *
   backtest_window_days: 30
-
-# ---- Optimization ----
 optimization:
   enabled: true
-  improvement_threshold: 0.05        # require >5% Sharpe/PnL gain
+  improvement_threshold: 0.05
   param_grid:
-    min_confidence: [0.55, 0.65, 0.75]
-    min_edge: [0.02, 0.04, 0.06]
-    kelly_fraction: [0.10, 0.25, 0.50]
-
-# ---- Learning ----
+    min_confidence:
+    - 0.55
+    - 0.65
+    - 0.75
+    min_edge:
+    - 0.02
+    - 0.04
+    - 0.06
+    kelly_fraction:
+    - 0.1
+    - 0.25
+    - 0.5
 learning:
   enabled: true
   lookback_days: 14
   keep_best_n_prompts: 5
-
-# ---- Dashboard ----
+  source_trust_enabled: true
+  source_trust_lookback_days: 30
+lane_rebalancer:
+  enabled: true
+  lookback_days: 7
+  blend_rate: 0.2
+  min_budget_pct: 0.1
+  max_budget_pct: 0.6
+  min_sample_size: 10
+  min_closes_per_lane: 5
 dashboard:
   host: 127.0.0.1
   port: 8000

@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card wide">
+  <h2>OLLAMA MODELS // host {{ summary.host }}</h2>
+  <p class="muted">
+    per-tier telemetry from <code>ollama_stats</code>. fast serves event_sniper +
+    scalping re-scores; deep handles the signal pipeline + longshot; validator
+    cross-checks high-stakes entries at
+    <code>&ge;${{ '%.0f'|format(summary.validator_threshold_usd) }}</code>.
+    At small shadow budgets, positions stay below the threshold and the
+    validator is <b>dormant by design</b> — that's not a broken model.
+  </p>
+  <table class="dense">
+    <thead>
+      <tr>
+        <th>tier</th>
+        <th>model</th>
+        <th>avg lat (10)</th>
+        <th>avg lat (100)</th>
+        <th>err rate (100)</th>
+        <th>calls 1h / 24h</th>
+        <th>in vram?</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for t in summary.tiers %}
+      <tr>
+        <td><strong>{{ t.tier }}</strong></td>
+        <td><code>{{ t.model }}</code></td>
+        <td>{{ '%.0f'|format(t.avg_latency_ms_10) }} ms</td>
+        <td>{{ '%.0f'|format(t.avg_latency_ms_100) }} ms ({{ t.n_last_100 }})</td>
+        <td>
+          {% if t.error_rate_100 > 0.2 %}
+            <span class="bad">{{ '%.1f'|format(t.error_rate_100 * 100) }}%</span>
+          {% elif t.error_rate_100 > 0.05 %}
+            <span class="status status--pending_fill">{{ '%.1f'|format(t.error_rate_100 * 100) }}%</span>
+          {% else %}
+            <span class="ok">{{ '%.1f'|format(t.error_rate_100 * 100) }}%</span>
+          {% endif %}
+        </td>
+        <td>
+          {{ t.n_1h }} / {{ t.n_24h }}
+          {% if t.tier == 'validator' and t.n_24h == 0 %}
+            <span class="status status--pending_fill" title="Fires only on positions &ge; ${{ '%.0f'|format(summary.validator_threshold_usd) }}; budget too small to trigger">DORMANT</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if t.loaded_in_vram %}
+            <span class="status status--open">LOADED</span>
+          {% elif t.tier == 'validator' and t.n_24h == 0 %}
+            <span class="muted" title="Swapped out because it hasn't been called — normal at small budgets">standby</span>
+          {% else %}
+            <span class="muted">unloaded</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="grid">
+<div class="card">
+  <h2>QUEUE DEPTH</h2>
+  <p class="muted">
+    in-flight calls per tier. alert threshold:
+    <code>{{ summary.queue_alert_threshold }}</code>. when the fast queue saturates,
+    event_sniper falls back to the keyword heuristic instead of waiting on the GPU.
+  </p>
+  <table class="dense">
+    <thead>
+      <tr><th>tier</th><th>pending</th><th>status</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>fast</td>
+        <td>{{ summary.queue_depths.fast }}</td>
+        <td>
+          {% if summary.fast_saturated %}
+            <span class="status status--paused">SATURATED</span>
+          {% else %}
+            <span class="status status--open">OK</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td>deep</td>
+        <td>{{ summary.queue_depths.deep }}</td>
+        <td><span class="status status--open">OK</span></td>
+      </tr>
+      <tr>
+        <td>validator</td>
+        <td>{{ summary.queue_depths.validator }}</td>
+        <td><span class="status status--open">OK</span></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>LOADED IN VRAM // /api/ps</h2>
+  {% if summary.running_models %}
+  <table class="dense">
+    <thead>
+      <tr><th>model</th><th>size</th><th>expires</th></tr>
+    </thead>
+    <tbody>
+    {% for m in summary.running_models %}
+      <tr>
+        <td><code>{{ m.name }}</code></td>
+        <td>{{ m.size or '' }}</td>
+        <td class="muted">{{ m.expires_at | datetimefmt }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="muted">no models currently loaded.</p>
+  {% endif %}
+</div>
+</div>
+{% endblock %}

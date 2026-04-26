@@ -4,36 +4,67 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   {% if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
-  <title>{{ title }} - Quantorpolybot</title>
+  <title>{{ title }} // NEXOPOLYBOT</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
-<body>
-  {% if dry_run or not live_enabled %}
-    <div class="banner banner--warn">
-      DRY RUN MODE - no real orders will be placed.
-      (dry_run={{ dry_run }}, live_trading_enabled={{ live_enabled }})
+<body class="mode--{{ mode }}">
+  <div class="scanlines" aria-hidden="true"></div>
+  <div class="gridlines" aria-hidden="true"></div>
+
+  {% if mode == 'real' %}
+    <div class="banner banner--real">
+      <span class="blink">●</span> REAL CAPITAL ACTIVE &middot; orders route to wallet &middot;
+      clob_ready={{ 'YES' if clob_ready else 'NO' }}
     </div>
   {% else %}
-    <div class="banner banner--live">LIVE TRADING ENABLED</div>
+    <div class="banner banner--shadow">
+      [ SHADOW ] simulated capital &middot; zero wallet risk &middot;
+      real_total=${{ '%.0f'|format(real_total) }} shadow_total=${{ '%.0f'|format(shadow_total) }}
+    </div>
   {% endif %}
 
   <header class="topbar">
-    <h1>Quantorpolybot</h1>
+    <div class="brand">
+      <span class="brand__glyph">◢◤</span>
+      <h1>NEXOPOLY<span class="brand__accent">BOT</span></h1>
+      <span class="brand__tag">v2 // {{ mode | upper }}</span>
+    </div>
     <nav>
-      <a href="/">Overview</a>
-      <a href="/markets">Markets</a>
-      <a href="/signals">Signals</a>
-      <a href="/orders">Orders</a>
-      <a href="/sources">Sources</a>
-      <a href="/logs">Logs</a>
-      <a href="/settings">Settings</a>
+      <a href="/" class="{{ 'active' if title == 'Overview' else '' }}">OVERVIEW</a>
+      <a href="/markets" class="{{ 'active' if title == 'Markets' else '' }}">MARKETS</a>
+      <a href="/signals" class="{{ 'active' if title == 'Signals' else '' }}">SIGNALS</a>
+      <a href="/trades" class="{{ 'active' if title == 'Trades' else '' }}">TRADES</a>
+      <a href="/shadow-trading" class="{{ 'active' if title == 'Lanes' else '' }}">LANES</a>
+      <a href="/models" class="{{ 'active' if title == 'Models' else '' }}">MODELS</a>
+      <a href="/sources" class="{{ 'active' if title == 'Sources' else '' }}">SOURCES</a>
+      <a href="/logs" class="{{ 'active' if title == 'Logs' else '' }}">LOGS</a>
+      <a href="/settings" class="{{ 'active' if title == 'Settings' else '' }}">SETTINGS</a>
     </nav>
   </header>
+
+  {% if counts %}
+  <div class="hud">
+    <div class="hud__cell"><span class="hud__k">MKTS</span><span class="hud__v">{{ counts.markets_active }}</span></div>
+    <div class="hud__cell"><span class="hud__k">FEED/1H</span><span class="hud__v">{{ counts.feed_1h }}</span></div>
+    <div class="hud__cell"><span class="hud__k">SIG/1H</span><span class="hud__v">{{ counts.signals_1h }}</span></div>
+    <div class="hud__cell"><span class="hud__k">OPEN</span><span class="hud__v">{{ counts.open_positions }}</span></div>
+    <div class="hud__cell"><span class="hud__k">MODE</span><span class="hud__v hud__v--{{ mode }}">{{ mode | upper }}</span></div>
+    <div class="hud__cell"><span class="hud__k">CLOB</span><span class="hud__v {{ 'ok' if clob_ready else 'bad' }}">{{ 'READY' if clob_ready else 'OFF' }}</span></div>
+  </div>
+  {% endif %}
 
   <main>
     {% block content %}{% endblock %}
   </main>
 
-  <footer><small>Auto-refresh every {{ refresh }}s</small></footer>
+  <footer>
+    <small>
+      <span class="dot"></span> live &middot; refresh {{ refresh }}s &middot;
+      shadow ${{ '%.0f'|format(shadow_total) }} / real ${{ '%.0f'|format(real_total) }}
+    </small>
+    {% if nexo_footer %}
+      <small class="nexo-footer-wrap">{{ nexo_footer | safe }}</small>
+    {% endif %}
+  </footer>
 </body>
 </html>
